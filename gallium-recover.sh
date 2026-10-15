@@ -2,7 +2,10 @@
 # Spend a Gallium escrow with the bank and borrower recovery packages.
 # Bitcoin Core 27 or newer must be able to see the chain that holds the funds.
 #
-#   gallium-recover.sh BANK_PACKAGE BORROWER_PACKAGE DESTINATION_ADDRESS
+#   ./gallium-recover.sh
+#
+# The script asks for the bank package, the borrower package, and the
+# address that should receive the funds.
 #
 # For the hosted regtest, SSH to that machine first, then run this script.
 # Mainnet uses the same command on the computer that runs your node.
@@ -12,14 +15,30 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
 
 usage() {
-  echo "Usage: gallium-recover.sh BANK_PACKAGE BORROWER_PACKAGE DESTINATION_ADDRESS" >&2
+  echo "Usage: ./gallium-recover.sh" >&2
+  echo "The script asks for the bank package, the borrower package, and the destination address." >&2
   exit 1
+}
+
+prompt_line() {
+  local label="$1"
+  local answer=""
+  if [[ ! -r /dev/tty ]]; then
+    echo "A terminal is required to enter ${label}." >&2
+    exit 1
+  fi
+  while [[ -z "${answer}" ]]; do
+    read -r -p "${label}: " answer </dev/tty
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+  done
+  printf '%s' "${answer}"
 }
 
 confirm() {
@@ -305,15 +324,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
-if [[ "$#" -ne 3 ]]; then
+if [[ "$#" -ne 0 ]]; then
   usage
 fi
 
 echo "gallium-recover.sh ${SCRIPT_VERSION}"
-
-LEFT_FILE="$1"
-RIGHT_FILE="$2"
-DESTINATION="$3"
+echo "Enter the two recovery packages and the address that should receive the funds."
+LEFT_FILE="$(prompt_line "Bank package file")"
+RIGHT_FILE="$(prompt_line "Borrower package file")"
+DESTINATION="$(prompt_line "Destination address")"
 BITCOIN_CLI="${BITCOIN_CLI:-}"
 
 if [[ ! -f "${LEFT_FILE}" || ! -f "${RIGHT_FILE}" ]]; then

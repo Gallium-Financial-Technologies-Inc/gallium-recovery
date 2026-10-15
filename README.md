@@ -8,18 +8,17 @@ The Gallium app pins an exact commit and SHA-256 of `gallium-recover.sh`. It dow
 
 ```bash
 chmod +x gallium-recover.sh
-./gallium-recover.sh BANK_PACKAGE BORROWER_PACKAGE DESTINATION_ADDRESS
+./gallium-recover.sh
 ```
 
-`DESTINATION_ADDRESS` is the address that receives the funds. The escrow deposit address is already inside the packages.
+The script asks for the bank package path, the borrower package path, and the address that should receive the funds. The escrow deposit address is already inside the packages.
 
 For a hosted regtest, SSH to the machine that runs that Bitcoin Core node, then run the same command. On mainnet, run it on the computer whose node has the chain.
 
 When `bitcoin-cli` cannot use the node's default cookie file:
 
 ```bash
-BITCOIN_RPC_USER=... BITCOIN_RPC_PASSWORD=... \
-  ./gallium-recover.sh BANK_PACKAGE BORROWER_PACKAGE DESTINATION_ADDRESS
+BITCOIN_RPC_USER=... BITCOIN_RPC_PASSWORD=... ./gallium-recover.sh
 ```
 
 Optional: `BITCOIN_RPC_HOST`, `BITCOIN_RPC_PORT`.
