@@ -18,24 +18,85 @@ The same two key backups work for every loan. The script asks for four things:
 3. The loan index shown on that loan
 4. The Bitcoin address that should receive the funds
 
-Bitcoin Core 27 or newer must already be running on this computer, on the same network as the coins. If it is missing or older, the script asks before installing 27.1 from [bitcoincore.org](https://bitcoincore.org) into `~/.gallium-recovery/`.
+## Bitcoin Core
 
-### Hosted regtest
+The script runs `bitcoin-cli` from your `PATH`, or from `BITCOIN_CLI` if that variable is a full path to the binary. Extracting the tarball into `~/Downloads` does not put it on `PATH`, so a new terminal still reports that Bitcoin Core is not installed. Core 27 or newer also has to be running on this computer before the script can see the coins.
 
-Do not SSH to the host, and do not point the script at the host's RPC port. That would send the private keys to another machine. Start your own regtest node and let it sync from the host over the peer port:
+If `bitcoin-cli` is missing or older than 27, the script asks before downloading 27.1 from [bitcoincore.org](https://bitcoincore.org) into `~/.gallium-recovery/bitcoin-core-27.1`. That install still needs the steps below: a permanent `PATH` entry, a macOS signature, and a running `bitcoind`. The script does not start the node.
+
+### Install and keep `bitcoin-cli` on PATH
+
+Download Bitcoin Core 27.1 or newer from [bitcoincore.org](https://bitcoincore.org/en/download/). These commands assume the 27.1 tarball was extracted to `~/Downloads/bitcoin-27.1`. If the script installed Core for you, use `~/.gallium-recovery/bitcoin-core-27.1` in place of `~/Downloads/bitcoin-27.1`.
+
+On macOS the official binaries are unsigned, so the shell exits with `zsh: killed` as soon as `bitcoind` or `bitcoin-cli` starts. Sign them once:
+
+```bash
+codesign --force -s - \
+  ~/Downloads/bitcoin-27.1/bin/bitcoind \
+  ~/Downloads/bitcoin-27.1/bin/bitcoin-cli \
+  ~/Downloads/bitcoin-27.1/bin/bitcoin-tx \
+  ~/Downloads/bitcoin-27.1/bin/bitcoin-wallet
+```
+
+Add that `bin` directory to the shell startup file so every new terminal can find it.
+
+zsh, the default on macOS:
+
+```bash
+echo 'export PATH="$HOME/Downloads/bitcoin-27.1/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+bitcoin-cli -version
+```
+
+bash:
+
+```bash
+echo 'export PATH="$HOME/Downloads/bitcoin-27.1/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+bitcoin-cli -version
+```
+
+`bitcoin-cli -version` prints `Bitcoin Core version v27.1.0` or a newer 27.x or 28.x line. To point only this tool at a binary, put this in the same startup file instead of the `PATH` line:
+
+```bash
+export BITCOIN_CLI="$HOME/Downloads/bitcoin-27.1/bin/bitcoin-cli"
+```
+
+`bitcoind` still has to be on `PATH`, because you start the node yourself.
+
+### Regtest
+
+Run a regtest node on this computer. When the chain already lives on another machine, peer to it. Leave that machine's RPC port closed, and leave `BITCOIN_RPC_HOST` unset. The key files stay on this computer.
+
+`HOST` is the machine that already has the regtest chain. Its peer port, 18444, must accept connections from your IP.
 
 ```bash
 bitcoind -regtest -daemon -connect=HOST:18444 -fallbackfee=0.0002
 bitcoin-cli -regtest getblockcount
 ```
 
-`HOST` is the machine that already has the regtest chain. Port 18444 must be reachable from your computer. When the block count matches that host, run `./gallium-recover.sh` with no extra environment variables.
+When that block count matches the host, run `./gallium-recover.sh`.
+
+After the script prints a transaction id, mine one block on this node so the host records the confirmation:
+
+```bash
+bitcoin-cli -regtest createwallet mine >/dev/null 2>&1 || true
+bitcoin-cli -regtest -rpcwallet=mine generatetoaddress 1 "$(bitcoin-cli -regtest -rpcwallet=mine getnewaddress)"
+bitcoin-cli -regtest stop
+```
 
 ### Mainnet
 
-Use the same command on the computer whose node is synced to mainnet.
+Start the node on this computer and wait until it has finished syncing:
 
-When `bitcoin-cli` cannot use the node's default cookie file:
+```bash
+bitcoind -daemon
+bitcoin-cli getblockchaininfo
+```
+
+Use the same `./gallium-recover.sh` once `initialblockdownload` is false.
+
+When `bitcoin-cli` cannot read the node's default cookie file:
 
 ```bash
 BITCOIN_RPC_USER=... BITCOIN_RPC_PASSWORD=... ./gallium-recover.sh
