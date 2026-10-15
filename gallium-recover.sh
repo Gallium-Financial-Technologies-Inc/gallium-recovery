@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 # Spend a Gallium escrow with the bank and borrower key backup files.
-# Bitcoin Core 27 or newer must be running on this computer and able to see
-# the chain that holds the funds.
 #
 #   ./gallium-recover.sh
 #
-# The script asks for the path to each key backup, the loan index, and the
-# address that should receive the funds. The same two files work for every loan.
-#
-# For a hosted regtest, start a local regtest node peered to that host:
-#   bitcoind -regtest -daemon -connect=HOST:18444 -fallbackfee=0.0002
-# Do not point this script at a remote RPC server. The key files stay here.
+# The script asks for the two key backups, the loan index, and the address
+# that should receive the funds. It then finds Bitcoin Core 27 or newer, or
+# asks before installing 27.1. On macOS it signs the binaries. It starts a
+# node on this computer when one is not already running. On regtest it asks
+# for the host that already has the chain and peers to port 18444.
+# The key files stay on this computer.
 #
 # Optional, when bitcoin-cli cannot use the node's default cookie:
 #   BITCOIN_RPC_HOST BITCOIN_RPC_PORT BITCOIN_RPC_USER BITCOIN_RPC_PASSWORD
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -26,6 +24,13 @@ usage() {
   echo "Usage: ./gallium-recover.sh" >&2
   echo "The script asks for the path to the bank key backup, the path to the borrower key backup, the loan index, and the destination address." >&2
   exit 1
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
 }
 
 prompt_line() {
@@ -37,10 +42,20 @@ prompt_line() {
   fi
   while [[ -z "${answer}" ]]; do
     read -r -p "${label}: " answer </dev/tty
-    answer="${answer#"${answer%%[![:space:]]*}"}"
-    answer="${answer%"${answer##*[![:space:]]}"}"
+    answer="$(trim "${answer}")"
   done
   printf '%s' "${answer}"
+}
+
+prompt_optional() {
+  local label="$1"
+  local answer=""
+  if [[ ! -r /dev/tty ]]; then
+    echo "A terminal is required to enter ${label}." >&2
+    exit 1
+  fi
+  read -r -p "${label}: " answer </dev/tty
+  trim "${answer}"
 }
 
 confirm() {
@@ -175,33 +190,280 @@ install_core() {
   echo "Installed Bitcoin Core ${CORE_VERSION} at ${INSTALL_ROOT}."
 }
 
-core_major() {
-  local line
-  line="$("${BITCOIN_CLI}" -version 2>/dev/null | head -n 1 || true)"
-  sed -n 's/.* v\([0-9][0-9]*\)\..*/\1/p' <<<"${line}" | head -n 1
+read_core_version() {
+  local cli="$1"
+  local status=0
+  local output=""
+  CORE_VERSION_STATUS=0
+  CORE_VERSION_MAJOR=""
+  output="$("${cli}" -version 2>/dev/null)" || status=$?
+  CORE_VERSION_STATUS="${status}"
+  if [[ "${status}" -ne 0 ]]; then
+    return 1
+  fi
+  output="${output%%$'\n'*}"
+  CORE_VERSION_MAJOR="$(sed -n 's/.* v\([0-9][0-9]*\)\..*/\1/p' <<<"${output}")"
+  CORE_VERSION_MAJOR="${CORE_VERSION_MAJOR%%$'\n'*}"
+  [[ -n "${CORE_VERSION_MAJOR}" ]]
 }
 
-ensure_core() {
-  local major=""
-  if [[ -x "${BITCOIN_CLI}" ]]; then
-    major="$(core_major)"
-  elif command -v bitcoin-cli >/dev/null 2>&1; then
-    BITCOIN_CLI="$(command -v bitcoin-cli)"
-    major="$(core_major)"
+sign_dir() {
+  local dir="$1"
+  local name path
+  for name in bitcoind bitcoin-cli bitcoin-tx bitcoin-wallet; do
+    path="${dir}/${name}"
+    if [[ -x "${path}" ]]; then
+      codesign --force -s - "${path}"
+    fi
+  done
+}
+
+accept_cli() {
+  local cli="$1"
+  local dir
+  dir="$(dirname "${cli}")"
+  [[ -x "${cli}" && -x "${dir}/bitcoind" ]] || return 1
+  if ! read_core_version "${cli}"; then
+    if [[ "$(uname -s)" != "Darwin" || -n "${CORE_VERSION_MAJOR}" ]]; then
+      return 1
+    fi
+    echo "macOS is blocking ${cli}."
+    echo "The script will run:"
+    echo "  codesign --force -s - ${dir}/bitcoind ${dir}/bitcoin-cli"
+    confirm "Sign these Bitcoin Core binaries?" || return 1
+    sign_dir "${dir}"
+    read_core_version "${cli}" || return 1
   fi
-  if [[ -n "${major}" && "${major}" -ge "${CORE_MAJOR}" ]]; then
+  [[ "${CORE_VERSION_MAJOR}" -ge "${CORE_MAJOR}" ]] || return 1
+  BITCOIN_CLI="${cli}"
+  BITCOIND="${dir}/bitcoind"
+}
+
+locate_core() {
+  local cli dir
+  if [[ -n "${BITCOIN_CLI}" ]]; then
+    if ! accept_cli "${BITCOIN_CLI}"; then
+      echo "BITCOIN_CLI is set but is not usable Bitcoin Core ${CORE_MAJOR} or newer." >&2
+      exit 1
+    fi
+    return 0
+  fi
+  if command -v bitcoin-cli >/dev/null 2>&1; then
+    accept_cli "$(command -v bitcoin-cli)" && return 0
+  fi
+  if [[ -x "${INSTALL_ROOT}/bin/bitcoin-cli" ]]; then
+    accept_cli "${INSTALL_ROOT}/bin/bitcoin-cli" && return 0
+  fi
+  shopt -s nullglob
+  for dir in "${HOME}/Downloads"/bitcoin-*/bin "${HOME}/.gallium-recovery"/bitcoin-core-*/bin; do
+    if [[ -x "${dir}/bitcoin-cli" ]]; then
+      if accept_cli "${dir}/bitcoin-cli"; then
+        shopt -u nullglob
+        return 0
+      fi
+    fi
+  done
+  shopt -u nullglob
+  for cli in /usr/local/bin/bitcoin-cli /opt/homebrew/bin/bitcoin-cli; do
+    if [[ -x "${cli}" ]]; then
+      accept_cli "${cli}" && return 0
+    fi
+  done
+  return 1
+}
+
+maybe_persist_path() {
+  local dir profile line
+  dir="$(dirname "${BITCOIN_CLI}")"
+  if command -v bitcoin-cli >/dev/null 2>&1 && [[ "$(command -v bitcoin-cli)" == "${BITCOIN_CLI}" ]]; then
+    return 0
+  fi
+  case "${SHELL:-}" in
+    */zsh) profile="${HOME}/.zshrc" ;;
+    */bash) profile="${HOME}/.bashrc" ;;
+    *) profile="${HOME}/.profile" ;;
+  esac
+  if [[ -f "${profile}" ]] && grep -F "${dir}" "${profile}" >/dev/null 2>&1; then
+    return 0
+  fi
+  line="export PATH=\"${dir}:\$PATH\""
+  echo "New terminals cannot see bitcoin-cli yet."
+  echo "The script will add this line to ${profile}:"
+  echo "  ${line}"
+  if confirm "Add Bitcoin Core to ${profile}?"; then
+    printf '\n%s\n' "${line}" >> "${profile}"
+    echo "Added. This run already uses ${BITCOIN_CLI}."
+  fi
+}
+
+valid_host() {
+  local host="$1"
+  [[ -n "${host}" && "${host}" != *[!A-Za-z0-9.:-]* ]]
+}
+
+peer_address() {
+  local host="$1"
+  if [[ "${host}" == *:* ]]; then
+    printf '%s' "${host}"
+  else
+    printf '%s:18444' "${host}"
+  fi
+}
+
+node_responds() {
+  RPC_PROBE_STATUS=0
+  RPC_PROBE_OUTPUT="$(bitcoin_cli getblockcount 2>&1)" || RPC_PROBE_STATUS=$?
+  [[ "${RPC_PROBE_STATUS}" -eq 0 ]]
+}
+
+node_is_down() {
+  [[ "${RPC_PROBE_OUTPUT}" == *"Could not connect"* || "${RPC_PROBE_OUTPUT}" == *"Connection refused"* ]]
+}
+
+node_is_starting() {
+  [[ "${RPC_PROBE_OUTPUT}" == *"Loading"* || "${RPC_PROBE_OUTPUT}" == *"Starting"* || "${RPC_PROBE_OUTPUT}" == *"Verifying"* || "${RPC_PROBE_OUTPUT}" == *"-28"* ]]
+}
+
+wait_until_ready() {
+  local info blocks headers ibd peers started now told=0
+  started="$(date +%s)"
+  echo "Waiting for Bitcoin Core..."
+  while true; do
+    if info="$(bitcoin_cli getblockchaininfo 2>/dev/null)"; then
+      blocks="$(sed -n 's/.*"blocks": \([0-9][0-9]*\).*/\1/p' <<<"${info}")"
+      headers="$(sed -n 's/.*"headers": \([0-9][0-9]*\).*/\1/p' <<<"${info}")"
+      ibd="$(sed -n 's/.*"initialblockdownload": \(true\|false\).*/\1/p' <<<"${info}")"
+      blocks="${blocks%%$'\n'*}"
+      headers="${headers%%$'\n'*}"
+      ibd="${ibd%%$'\n'*}"
+      if [[ "${NETWORK}" == "regtest" && -n "${REGTEST_PEER}" ]]; then
+        peers="$(bitcoin_cli getconnectioncount 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ "${peers}" =~ ^[0-9]+$ ]] || peers=0
+        if [[ "${peers}" -ge 1 && "${ibd}" == "false" && -n "${blocks}" && "${blocks}" == "${headers}" ]]; then
+          echo "Connected to ${REGTEST_PEER}. Block height ${blocks}."
+          return 0
+        fi
+        echo "Waiting for ${REGTEST_PEER}. Height ${blocks:-0}, peers ${peers}."
+        if [[ "${peers}" -eq 0 ]]; then
+          now="$(date +%s)"
+          if [[ $((now - started)) -gt 90 ]]; then
+            echo "Could not connect to ${REGTEST_PEER}." >&2
+            echo "Port 18444 on that host must accept connections from this computer." >&2
+            exit 1
+          fi
+        fi
+      elif [[ "${ibd}" == "false" && -n "${blocks}" && "${blocks}" == "${headers}" ]]; then
+        echo "Bitcoin Core is ready. Block height ${blocks}."
+        return 0
+      else
+        echo "Syncing ${blocks:-0} of ${headers:-0} blocks."
+        if [[ "${told}" -eq 0 ]]; then
+          echo "Sync can take a long time. Stop this script and run it again later; the node keeps syncing."
+          told=1
+        fi
+      fi
+    elif [[ "${NETWORK}" == "regtest" && -n "${REGTEST_PEER}" ]]; then
+      now="$(date +%s)"
+      if [[ $((now - started)) -gt 90 ]]; then
+        echo "Could not connect to ${REGTEST_PEER}." >&2
+        echo "Port 18444 on that host must accept connections from this computer." >&2
+        exit 1
+      fi
+    fi
+    sleep 2
+  done
+}
+
+start_node() {
+  local args=() host peer
+  case "${NETWORK}" in
+    mainnet)
+      args=(-daemon)
+      ;;
+    testnet)
+      args=(-testnet -daemon)
+      ;;
+    signet)
+      args=(-signet -daemon)
+      ;;
+    regtest)
+      echo "No regtest node is running on this computer."
+      echo "If the coins are on another machine, enter that machine's address."
+      echo "Its peer port 18444 must accept connections from this computer."
+      echo "Leave the address blank to start an empty regtest node on this computer."
+      host="$(prompt_optional "Regtest host address")"
+      args=(-regtest -daemon -fallbackfee=0.0002)
+      if [[ -n "${host}" ]]; then
+        if ! valid_host "${host}"; then
+          echo "That host address is not valid. Enter an IP address or a hostname." >&2
+          exit 1
+        fi
+        peer="$(peer_address "${host}")"
+        REGTEST_PEER="${peer}"
+        args+=("-connect=${peer}")
+      fi
+      ;;
+  esac
+  echo "The script will run:"
+  echo "  ${BITCOIND} ${args[*]}"
+  confirm "Start Bitcoin Core?" || exit 1
+  if ! "${BITCOIND}" "${args[@]}"; then
+    echo "Could not start Bitcoin Core." >&2
+    exit 1
+  fi
+  STARTED_NODE=1
+}
+
+prepare_node() {
+  if ! locate_core; then
+    echo "The script will download Bitcoin Core ${CORE_VERSION} from bitcoincore.org into ${INSTALL_ROOT}."
+    confirm "Install Bitcoin Core ${CORE_VERSION}?" || exit 1
+    install_core
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      echo "Signing Bitcoin Core so macOS will run it."
+      sign_dir "${INSTALL_ROOT}/bin"
+    fi
+    if ! read_core_version "${BITCOIN_CLI}"; then
+      echo "Bitcoin Core ${CORE_VERSION} is still not available." >&2
+      exit 1
+    fi
+    if [[ "${CORE_VERSION_MAJOR}" -lt "${CORE_MAJOR}" ]]; then
+      echo "Bitcoin Core ${CORE_VERSION} is still not available." >&2
+      exit 1
+    fi
+    BITCOIND="${INSTALL_ROOT}/bin/bitcoind"
+  fi
+  maybe_persist_path
+  if node_responds || node_is_starting; then
+    wait_until_ready
     return
   fi
-  if [[ -z "${major}" ]]; then
-    confirm "Bitcoin Core is not installed. Install ${CORE_VERSION} from bitcoincore.org?" || exit 1
-  else
-    confirm "Bitcoin Core ${major} is older than ${CORE_MAJOR}. Install ${CORE_VERSION}?" || exit 1
+  if node_is_down; then
+    start_node
+    wait_until_ready
+    return
   fi
-  install_core
-  major="$(core_major)"
-  if [[ -z "${major}" || "${major}" -lt "${CORE_MAJOR}" ]]; then
-    echo "Bitcoin Core ${CORE_VERSION} is still not available." >&2
-    exit 1
+  echo "${RPC_PROBE_OUTPUT}" >&2
+  echo "Bitcoin Core is not accepting local commands. The keys stay on this computer." >&2
+  exit 1
+}
+
+finish_regtest() {
+  local address
+  [[ "${NETWORK}" == "regtest" ]] || return 0
+  echo "The script can mine 1 block so other machines see this payment."
+  echo "It will run: ${BITCOIN_CLI} -regtest -rpcwallet=mine generatetoaddress 1 <new address>"
+  if confirm "Mine 1 block now?"; then
+    bitcoin_cli createwallet mine >/dev/null 2>&1 || bitcoin_cli loadwallet mine >/dev/null
+    address="$(bitcoin_cli -rpcwallet=mine getnewaddress)"
+    bitcoin_cli -rpcwallet=mine generatetoaddress 1 "${address}"
+  fi
+  if [[ "${STARTED_NODE}" -eq 1 ]]; then
+    echo "The script will run: ${BITCOIN_CLI} -regtest stop"
+    if confirm "Stop the local regtest node?"; then
+      bitcoin_cli stop >/dev/null || true
+      echo "Stopped Bitcoin Core."
+    fi
   fi
 }
 
@@ -229,19 +491,13 @@ checksum_for() {
   local info sum
   if ! info="$(bitcoin_cli getdescriptorinfo "$1" 2>&1)"; then
     echo "${info}" >&2
-    echo "Start Bitcoin Core on the ${NETWORK} network on this computer, then run this script again." >&2
-    if [[ "${NETWORK}" == "regtest" ]]; then
-      echo "For a hosted regtest, peer a local node with: bitcoind -regtest -daemon -connect=HOST:18444 -fallbackfee=0.0002" >&2
-    fi
+    echo "Bitcoin Core on this computer did not accept the descriptor." >&2
     exit 1
   fi
-  sum="$(sed -n 's/.*"checksum": "\([^"]*\)".*/\1/p' <<<"${info}" | head -n 1)"
+  sum="$(sed -n 's/.*"checksum": "\([^"]*\)".*/\1/p' <<<"${info}")"
+  sum="${sum%%$'\n'*}"
   if [[ -z "${sum}" ]]; then
     echo "Bitcoin Core did not return a descriptor checksum." >&2
-    echo "Start Bitcoin Core on the ${NETWORK} network on this computer, then run this script again." >&2
-    if [[ "${NETWORK}" == "regtest" ]]; then
-      echo "For a hosted regtest, peer a local node with: bitcoind -regtest -daemon -connect=HOST:18444 -fallbackfee=0.0002" >&2
-    fi
     exit 1
   fi
   printf '%s' "${sum}"
@@ -292,6 +548,10 @@ EOF
   prepare_descriptor
   [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tprvBorrower/7/0/*))' ]]
   [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tprvBank/7/1/*,tprvBorrower/7/1/*))' ]]
+  valid_host "203.0.113.10"
+  ! valid_host "not a host"
+  [[ "$(peer_address "203.0.113.10")" == "203.0.113.10:18444" ]]
+  [[ "$(peer_address "127.0.0.1:18444")" == "127.0.0.1:18444" ]]
   rm -rf "${dir}"
   echo "self-test ok"
 }
@@ -315,6 +575,9 @@ DESTINATION="$(prompt_line "Bitcoin address to receive the funds")"
 LEFT_FILE="${LEFT_FILE/#\~/${HOME}}"
 RIGHT_FILE="${RIGHT_FILE/#\~/${HOME}}"
 BITCOIN_CLI="${BITCOIN_CLI:-}"
+BITCOIND=""
+STARTED_NODE=0
+REGTEST_PEER=""
 
 if [[ ! -f "${LEFT_FILE}" || ! -f "${RIGHT_FILE}" ]]; then
   echo "No file was found at one of those paths. Enter the full path to each key backup file." >&2
@@ -359,7 +622,7 @@ case "${NETWORK}" in
 esac
 
 prepare_descriptor
-ensure_core
+prepare_node
 
 EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
 CHANGE_SUM="$(checksum_for "${CHANGE}")"
@@ -387,4 +650,9 @@ fi
 
 echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
 echo "Sending ${BALANCE} BTC to ${DESTINATION}"
-bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"
+if [[ "${NETWORK}" == "regtest" ]]; then
+  bitcoin_cli -rpcwallet="${WALLET}" -named sendall outputs="[\"${DESTINATION}\"]" fee_rate=0.0002
+else
+  bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"
+fi
+finish_regtest
