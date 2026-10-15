@@ -5,8 +5,8 @@
 #
 #   ./gallium-recover.sh
 #
-# The script asks for the path to each key backup and the address that
-# should receive the funds.
+# The script asks for the path to each key backup, the loan index, and the
+# address that should receive the funds. The same two files work for every loan.
 #
 # For a hosted regtest, start a local regtest node peered to that host:
 #   bitcoind -regtest -daemon -connect=HOST:18444 -fallbackfee=0.0002
@@ -17,14 +17,14 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
 
 usage() {
   echo "Usage: ./gallium-recover.sh" >&2
-  echo "The script asks for the path to the bank key backup, the path to the borrower key backup, and the destination address." >&2
+  echo "The script asks for the path to the bank key backup, the path to the borrower key backup, the loan index, and the destination address." >&2
   exit 1
 }
 
@@ -81,40 +81,37 @@ replace_all() {
 load_key_file() {
   local file="$1"
   local prefix="$2"
-  local role loan index network gallium xprv
+  local role network gallium xprv origin xpub
   role="$(field_value "${file}" "Role")"
-  loan="$(field_value "${file}" "Loan")"
-  index="$(field_value "${file}" "Loan index")"
   network="$(field_value "${file}" "Network")"
-  gallium="$(next_line "${file}" "Gallium key:")"
-  xprv="$(next_line "${file}" "Loan extended private key:")"
-  if [[ -z "${role}" || -z "${loan}" || -z "${index}" || -z "${network}" || -z "${gallium}" || -z "${xprv}" ]]; then
+  gallium="$(next_line "${file}" "Gallium account key:")"
+  xprv="$(next_line "${file}" "Account extended private key:")"
+  if [[ -z "${role}" || -z "${network}" || -z "${gallium}" || -z "${xprv}" ]]; then
     echo "Could not read a Gallium key backup: ${file}" >&2
-    echo "The file must contain Role, Loan, Loan index, Network, Gallium key, and Loan extended private key." >&2
-    exit 1
-  fi
-  if [[ ! "${index}" =~ ^[0-9]+$ ]]; then
-    echo "Loan index must be a number in ${file}." >&2
+    echo "The file must contain Role, Network, Gallium account key, and Account extended private key." >&2
     exit 1
   fi
   case "${xprv}" in
     *[!A-Za-z0-9]*)
-      echo "Loan extended private key is not a single key in ${file}." >&2
+      echo "Account extended private key is not a single key in ${file}." >&2
       exit 1
       ;;
   esac
-  case "${gallium}" in
-    *"/<0;1>/"*) ;;
-    *)
-      echo "Gallium key is missing its receive and change branches in ${file}." >&2
-      exit 1
-      ;;
-  esac
+  if [[ "${gallium}" != "["*"]"* ]]; then
+    echo "Gallium account key is not an account key in ${file}." >&2
+    exit 1
+  fi
+  origin="${gallium%%]*}"
+  xpub="${gallium#*]}"
+  if [[ -z "${origin}" || -z "${xpub}" || "${xpub}" == *"/"* ]]; then
+    echo "Gallium account key is not an account key in ${file}." >&2
+    exit 1
+  fi
   printf -v "${prefix}_role" '%s' "${role}"
-  printf -v "${prefix}_loan" '%s' "${loan}"
-  printf -v "${prefix}_index" '%s' "${index}"
   printf -v "${prefix}_network" '%s' "${network}"
   printf -v "${prefix}_gallium" '%s' "${gallium}"
+  printf -v "${prefix}_origin" '%s' "${origin}"
+  printf -v "${prefix}_xpub" '%s' "${xpub}"
   printf -v "${prefix}_xprv" '%s' "${xprv}"
 }
 
@@ -263,40 +260,38 @@ prepare_descriptor() {
   local bank borrower descriptor
   bank="$(party_xprv "Bank")"
   borrower="$(party_xprv "Borrower")"
-  descriptor="wsh(sortedmulti(2,${LEFT_gallium},${bank}/<0;1>/*,${borrower}/<0;1>/*))"
+  descriptor="wsh(sortedmulti(2,${LEFT_origin}/${LOAN_INDEX}]${LEFT_xpub}/${LOAN_INDEX}/<0;1>/*,${bank}/${LOAN_INDEX}/<0;1>/*,${borrower}/${LOAN_INDEX}/<0;1>/*))"
   EXTERNAL="$(replace_all "${descriptor}" "/<0;1>/*" "/0/*")"
   CHANGE="$(replace_all "${descriptor}" "/<0;1>/*" "/1/*")"
 }
 
 self_test() {
-  local dir gallium
+  local dir
   dir="$(mktemp -d)"
-  gallium='[aa/48h/1h/0h/2h/7]tpubGallium/<0;1>/*'
   cat >"${dir}/bank.txt" <<EOF
 Role: Bank
 Loan: LN-1
-Loan index: 7
 Network: regtest
-Gallium key:
-${gallium}
-Loan extended private key:
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Account extended private key:
 tprvBank
 EOF
   cat >"${dir}/borrower.txt" <<EOF
 Role: Borrower
-Loan: LN-1
-Loan index: 7
+Loan: LN-2
 Network: regtest
-Gallium key:
-${gallium}
-Loan extended private key:
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Account extended private key:
 tprvBorrower
 EOF
   load_key_file "${dir}/bank.txt" LEFT
   load_key_file "${dir}/borrower.txt" RIGHT
+  LOAN_INDEX=7
   prepare_descriptor
-  [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/0/*,tprvBank/0/*,tprvBorrower/0/*))' ]]
-  [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/1/*,tprvBank/1/*,tprvBorrower/1/*))' ]]
+  [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tprvBorrower/7/0/*))' ]]
+  [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tprvBank/7/1/*,tprvBorrower/7/1/*))' ]]
   rm -rf "${dir}"
   echo "self-test ok"
 }
@@ -311,10 +306,11 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 echo "gallium-recover.sh ${SCRIPT_VERSION}"
-echo "Enter the file path of each key backup, then the address that should receive the funds."
-echo "These are the files downloaded when each key was created, for example ~/Downloads/gallium-bank-key-LN-1.txt"
+echo "Enter the file path of each key backup, the loan index, then the address that should receive the funds."
+echo "The key backups are the files downloaded when each key was created. The loan index is the number shown on that loan."
 LEFT_FILE="$(prompt_line "Path to the bank key backup file")"
 RIGHT_FILE="$(prompt_line "Path to the borrower key backup file")"
+LOAN_INDEX="$(prompt_line "Loan index")"
 DESTINATION="$(prompt_line "Bitcoin address to receive the funds")"
 LEFT_FILE="${LEFT_FILE/#\~/${HOME}}"
 RIGHT_FILE="${RIGHT_FILE/#\~/${HOME}}"
@@ -332,6 +328,10 @@ fi
 load_key_file "${LEFT_FILE}" LEFT
 load_key_file "${RIGHT_FILE}" RIGHT
 
+if [[ ! "${LOAN_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "Loan index must be the number shown on the loan." >&2
+  exit 1
+fi
 if [[ "${LEFT_role}" == "${RIGHT_role}" ]]; then
   echo "Provide one bank key backup and one borrower key backup." >&2
   exit 1
@@ -344,8 +344,8 @@ if [[ "${RIGHT_role}" != "Bank" && "${RIGHT_role}" != "Borrower" ]]; then
   echo "Unrecognized key backup role: ${RIGHT_role}" >&2
   exit 1
 fi
-if [[ "${LEFT_loan}" != "${RIGHT_loan}" || "${LEFT_index}" != "${RIGHT_index}" || "${LEFT_network}" != "${RIGHT_network}" || "${LEFT_gallium}" != "${RIGHT_gallium}" ]]; then
-  echo "These key backups are not for the same loan." >&2
+if [[ "${LEFT_network}" != "${RIGHT_network}" || "${LEFT_gallium}" != "${RIGHT_gallium}" ]]; then
+  echo "These key backups are not for the same Gallium account and network." >&2
   exit 1
 fi
 
@@ -366,7 +366,7 @@ CHANGE_SUM="$(checksum_for "${CHANGE}")"
 EXTERNAL_CHECKED="${EXTERNAL}#${EXTERNAL_SUM}"
 CHANGE_CHECKED="${CHANGE}#${CHANGE_SUM}"
 
-WALLET="gallium-recovery-$(printf '%s' "${LEFT_loan}" | tr -c 'A-Za-z0-9._-' '-')"
+WALLET="gallium-recovery-${LOAN_INDEX}"
 if ! bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descriptors=true >/dev/null 2>&1; then
   bitcoin_cli loadwallet "${WALLET}" >/dev/null
 fi
@@ -385,6 +385,6 @@ if ! awk -v balance="${BALANCE}" 'BEGIN { exit !(balance + 0 > 0) }'; then
   exit 1
 fi
 
-echo "Loan ${LEFT_loan} on ${NETWORK}"
+echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
 echo "Sending ${BALANCE} BTC to ${DESTINATION}"
 bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"

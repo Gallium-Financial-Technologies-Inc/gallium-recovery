@@ -11,11 +11,12 @@ chmod +x gallium-recover.sh
 ./gallium-recover.sh
 ```
 
-The script asks for three things:
+The same two key backups work for every loan. The script asks for four things:
 
 1. Path to the bank key backup file, for example `~/Downloads/gallium-bank-key-LN-1.txt`
 2. Path to the borrower key backup file
-3. The Bitcoin address that should receive the funds
+3. The loan index shown on that loan
+4. The Bitcoin address that should receive the funds
 
 Bitcoin Core 27 or newer must already be running on this computer, on the same network as the coins. If it is missing or older, the script asks before installing 27.1 from [bitcoincore.org](https://bitcoincore.org) into `~/.gallium-recovery/`.
 
@@ -52,8 +53,8 @@ Compare the result with `SHA256SUMS` in this repository at the commit the Galliu
 
 ## What it does
 
-1. Checks that the two files are the bank key backup and the borrower key backup for the same loan.
-2. Builds the private deposit and change descriptors from the loan private keys and the Gallium public key in those files.
+1. Checks that the two files are the bank key backup and the borrower key backup for the same network.
+2. Builds the private deposit and change descriptors at the loan index you enter.
 3. Asks Bitcoin Core for each descriptor checksum.
 4. Imports them into a blank descriptor wallet.
 5. Sends the full balance to the destination address.
