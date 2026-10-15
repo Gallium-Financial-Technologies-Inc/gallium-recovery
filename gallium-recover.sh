@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -329,14 +329,17 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 echo "gallium-recover.sh ${SCRIPT_VERSION}"
-echo "Enter the two recovery packages and the address that should receive the funds."
-LEFT_FILE="$(prompt_line "Bank package file")"
-RIGHT_FILE="$(prompt_line "Borrower package file")"
-DESTINATION="$(prompt_line "Destination address")"
+echo "Enter the file path of each downloaded recovery package, then the address that should receive the funds."
+echo "Example path: ~/Downloads/gallium-recovery-bank.txt"
+LEFT_FILE="$(prompt_line "Path to the bank recovery package file")"
+RIGHT_FILE="$(prompt_line "Path to the borrower recovery package file")"
+DESTINATION="$(prompt_line "Bitcoin address to receive the funds")"
+LEFT_FILE="${LEFT_FILE/#\~/${HOME}}"
+RIGHT_FILE="${RIGHT_FILE/#\~/${HOME}}"
 BITCOIN_CLI="${BITCOIN_CLI:-}"
 
 if [[ ! -f "${LEFT_FILE}" || ! -f "${RIGHT_FILE}" ]]; then
-  echo "Both recovery package files must exist." >&2
+  echo "No file was found at one of those paths. Enter the full path to each recovery package file." >&2
   usage
 fi
 if [[ "${DESTINATION}" == *" "* || "${DESTINATION}" == *'"'* || -z "${DESTINATION}" ]]; then
