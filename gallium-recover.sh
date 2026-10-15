@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -457,7 +457,13 @@ finish_regtest() {
   echo "The script can mine 1 block so other machines see this payment."
   echo "It will run: ${BITCOIN_CLI} -regtest -rpcwallet=mine generatetoaddress 1 <new address>"
   if confirm "Mine 1 block now?"; then
-    bitcoin_cli createwallet mine >/dev/null 2>&1 || bitcoin_cli loadwallet mine >/dev/null
+    if ! bitcoin_cli createwallet mine >/dev/null 2>&1; then
+      load_err="$(bitcoin_cli loadwallet mine 2>&1 >/dev/null || true)"
+      if [[ -n "${load_err}" && "${load_err}" != *"already loaded"* ]]; then
+        echo "${load_err}" >&2
+        exit 1
+      fi
+    fi
     address="$(bitcoin_cli -rpcwallet=mine getnewaddress)"
     bitcoin_cli -rpcwallet=mine generatetoaddress 1 "${address}"
   fi
