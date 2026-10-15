@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -662,7 +662,7 @@ fi
 echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
 echo "Sending ${BALANCE} BTC to ${DESTINATION}"
 if [[ "${NETWORK}" == "regtest" ]]; then
-  bitcoin_cli -rpcwallet="${WALLET}" -named sendall outputs="[\"${DESTINATION}\"]" fee_rate=2
+  bitcoin_cli -rpcwallet="${WALLET}" -named sendall recipients="[\"${DESTINATION}\"]" fee_rate=2
 else
   bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"
 fi
