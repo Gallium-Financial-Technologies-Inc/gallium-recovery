@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -627,13 +627,11 @@ esac
 prepare_descriptor
 prepare_node
 
-EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
-CHANGE_SUM="$(checksum_for "${CHANGE}")"
-EXTERNAL_CHECKED="${EXTERNAL}#${EXTERNAL_SUM}"
-CHANGE_CHECKED="${CHANGE}#${CHANGE_SUM}"
-
 WALLET="gallium-recovery-${LOAN_INDEX}"
-if ! bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descriptors=true >/dev/null 2>&1; then
+FRESH_WALLET=0
+if bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descriptors=true >/dev/null 2>&1; then
+  FRESH_WALLET=1
+else
   load_err="$(bitcoin_cli loadwallet "${WALLET}" 2>&1 >/dev/null || true)"
   if [[ -n "${load_err}" && "${load_err}" != *"already loaded"* ]]; then
     echo "${load_err}" >&2
@@ -641,12 +639,18 @@ if ! bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descript
   fi
 fi
 
-IMPORT="$(bitcoin_cli -rpcwallet="${WALLET}" importdescriptors "[{\"desc\":\"${EXTERNAL_CHECKED}\",\"active\":false,\"internal\":false,\"range\":[0,0],\"timestamp\":0},{\"desc\":\"${CHANGE_CHECKED}\",\"active\":false,\"internal\":true,\"range\":[0,0],\"timestamp\":0}]")"
-SUCCESS_COUNT="$(printf '%s' "${IMPORT}" | grep -o '"success": *true' | wc -l | tr -d ' ')"
-if [[ "${SUCCESS_COUNT}" != "2" ]]; then
-  echo "Bitcoin Core rejected the recovery descriptors." >&2
-  echo "${IMPORT}" >&2
-  exit 1
+if [[ "${FRESH_WALLET}" -eq 1 ]]; then
+  EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
+  CHANGE_SUM="$(checksum_for "${CHANGE}")"
+  EXTERNAL_CHECKED="${EXTERNAL}#${EXTERNAL_SUM}"
+  CHANGE_CHECKED="${CHANGE}#${CHANGE_SUM}"
+  IMPORT="$(bitcoin_cli -rpcwallet="${WALLET}" importdescriptors "[{\"desc\":\"${EXTERNAL_CHECKED}\",\"active\":false,\"internal\":false,\"range\":[0,0],\"timestamp\":0},{\"desc\":\"${CHANGE_CHECKED}\",\"active\":false,\"internal\":true,\"range\":[0,0],\"timestamp\":0}]")"
+  SUCCESS_COUNT="$(printf '%s' "${IMPORT}" | grep -o '"success": *true' | wc -l | tr -d ' ' || true)"
+  if [[ "${SUCCESS_COUNT}" != "2" ]]; then
+    echo "Bitcoin Core rejected the recovery descriptors." >&2
+    echo "${IMPORT}" >&2
+    exit 1
+  fi
 fi
 
 BALANCE="$(bitcoin_cli -rpcwallet="${WALLET}" getbalance)"
