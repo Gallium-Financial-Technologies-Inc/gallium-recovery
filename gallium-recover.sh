@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
@@ -332,14 +332,17 @@ wait_until_ready() {
     if info="$(bitcoin_cli getblockchaininfo 2>/dev/null)"; then
       blocks="$(sed -n 's/.*"blocks": \([0-9][0-9]*\).*/\1/p' <<<"${info}")"
       headers="$(sed -n 's/.*"headers": \([0-9][0-9]*\).*/\1/p' <<<"${info}")"
-      ibd="$(sed -n 's/.*"initialblockdownload": \(true\|false\).*/\1/p' <<<"${info}")"
+      ibd="$(sed -n 's/.*"initialblockdownload": \([a-z]*\).*/\1/p' <<<"${info}")"
       blocks="${blocks%%$'\n'*}"
       headers="${headers%%$'\n'*}"
       ibd="${ibd%%$'\n'*}"
-      if [[ "${NETWORK}" == "regtest" && -n "${REGTEST_PEER}" ]]; then
+      if [[ "${NETWORK}" == "regtest" && -z "${REGTEST_PEER}" && -n "${blocks}" && "${blocks}" == "${headers}" ]]; then
+        echo "Bitcoin Core is ready. Block height ${blocks}."
+        return 0
+      elif [[ "${NETWORK}" == "regtest" && -n "${REGTEST_PEER}" ]]; then
         peers="$(bitcoin_cli getconnectioncount 2>/dev/null | tr -d '[:space:]' || true)"
         [[ "${peers}" =~ ^[0-9]+$ ]] || peers=0
-        if [[ "${peers}" -ge 1 && "${ibd}" == "false" && -n "${blocks}" && "${blocks}" == "${headers}" ]]; then
+        if [[ "${peers}" -ge 1 && -n "${blocks}" && "${blocks}" -gt 0 && "${blocks}" == "${headers}" ]]; then
           echo "Connected to ${REGTEST_PEER}. Block height ${blocks}."
           return 0
         fi
@@ -651,7 +654,7 @@ fi
 echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
 echo "Sending ${BALANCE} BTC to ${DESTINATION}"
 if [[ "${NETWORK}" == "regtest" ]]; then
-  bitcoin_cli -rpcwallet="${WALLET}" -named sendall outputs="[\"${DESTINATION}\"]" fee_rate=0.0002
+  bitcoin_cli -rpcwallet="${WALLET}" -named sendall outputs="[\"${DESTINATION}\"]" fee_rate=2
 else
   bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"
 fi
