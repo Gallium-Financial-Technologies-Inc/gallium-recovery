@@ -3,26 +3,28 @@
 #
 #   ./gallium-recover.sh
 #
-# The script asks for the two key backups, the loan index, and the address
-# that should receive the funds. It then finds Bitcoin Core 27 or newer, or
-# asks before installing 27.1. On macOS it signs the binaries. It starts a
-# node on this computer when one is not already running. On regtest it asks
-# for the host that already has the chain and peers to port 18444.
-# The key files stay on this computer.
+# One party creates a partially signed payment for an amount and a destination.
+# The other party checks that payment and finishes it with their own key.
+# Neither party needs the other party's private key.
+#
+# The script finds Bitcoin Core 27 or newer, or asks before installing 27.1.
+# On macOS it signs the binaries. It starts a node on this computer when one
+# is not already running. On regtest it asks for the host that already has the
+# chain and peers to port 18444. The key file stays on this computer.
 #
 # Optional, when bitcoin-cli cannot use the node's default cookie:
 #   BITCOIN_RPC_HOST BITCOIN_RPC_PORT BITCOIN_RPC_USER BITCOIN_RPC_PASSWORD
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="2.0.0"
 CORE_VERSION="27.1"
 CORE_MAJOR=27
 INSTALL_ROOT="${HOME}/.gallium-recovery/bitcoin-core-${CORE_VERSION}"
 
 usage() {
   echo "Usage: ./gallium-recover.sh" >&2
-  echo "The script asks for the path to the bank key backup, the path to the borrower key backup, the loan index, and the destination address." >&2
+  echo "The script asks whether to create a payment or complete one, then asks for your key file." >&2
   exit 1
 }
 
@@ -128,6 +130,91 @@ load_key_file() {
   printf -v "${prefix}_origin" '%s' "${origin}"
   printf -v "${prefix}_xpub" '%s' "${xpub}"
   printf -v "${prefix}_xprv" '%s' "${xprv}"
+  printf -v "${prefix}_own_xpub" '%s' "$(next_line "${file}" "Account public key (xpub):")"
+  printf -v "${prefix}_bank" '%s' "$(next_line "${file}" "Bank account key:")"
+  printf -v "${prefix}_borrower" '%s' "$(next_line "${file}" "Borrower account key:")"
+}
+
+fill_public_keys() {
+  local file="$1"
+  local network gallium bank borrower
+  network="$(field_value "${file}" "Network")"
+  gallium="$(next_line "${file}" "Gallium account key:")"
+  bank="$(next_line "${file}" "Bank account key:")"
+  borrower="$(next_line "${file}" "Borrower account key:")"
+  if [[ -z "${network}" || -z "${gallium}" || -z "${bank}" || -z "${borrower}" ]]; then
+    echo "Could not read the escrow public keys: ${file}" >&2
+    exit 1
+  fi
+  if [[ "${network}" != "${NETWORK}" || "${gallium}" != "${GALLIUM}" ]]; then
+    echo "Those public keys are not for this key backup's network and Gallium key." >&2
+    exit 1
+  fi
+  if [[ -z "${BANK_XPUB}" ]]; then
+    BANK_XPUB="${bank}"
+  fi
+  if [[ -z "${BORROWER_XPUB}" ]]; then
+    BORROWER_XPUB="${borrower}"
+  fi
+}
+
+use_key_file() {
+  local file="$1"
+  load_key_file "${file}" OWN
+  ROLE="${OWN_role}"
+  NETWORK="${OWN_network}"
+  GALLIUM="${OWN_gallium}"
+  ORIGIN="${OWN_origin}"
+  GALLIUM_XPUB="${OWN_xpub}"
+  XPRV="${OWN_xprv}"
+  BANK_XPUB="${OWN_bank}"
+  BORROWER_XPUB="${OWN_borrower}"
+  if [[ "${ROLE}" == "Bank" && -z "${BANK_XPUB}" ]]; then
+    BANK_XPUB="${OWN_own_xpub}"
+  fi
+  if [[ "${ROLE}" == "Borrower" && -z "${BORROWER_XPUB}" ]]; then
+    BORROWER_XPUB="${OWN_own_xpub}"
+  fi
+  if [[ -z "${BANK_XPUB}" || -z "${BORROWER_XPUB}" ]]; then
+    echo "This key file does not include the other party's public key."
+    local public_file
+    public_file="$(prompt_line "Path to the escrow public keys file")"
+    public_file="${public_file/#\~/${HOME}}"
+    if [[ ! -f "${public_file}" ]]; then
+      echo "No file was found at that path." >&2
+      exit 1
+    fi
+    fill_public_keys "${public_file}"
+  fi
+  if [[ -z "${BANK_XPUB}" || -z "${BORROWER_XPUB}" ]]; then
+    echo "The bank and borrower public keys are required." >&2
+    exit 1
+  fi
+  require_key_token "Bank account key" "${BANK_XPUB}"
+  require_key_token "Borrower account key" "${BORROWER_XPUB}"
+  if [[ "${ROLE}" == "Bank" && -n "${OWN_own_xpub}" && "${BANK_XPUB}" != "${OWN_own_xpub}" ]]; then
+    echo "The bank public key in this file does not match Account public key (xpub)." >&2
+    exit 1
+  fi
+  if [[ "${ROLE}" == "Borrower" && -n "${OWN_own_xpub}" && "${BORROWER_XPUB}" != "${OWN_own_xpub}" ]]; then
+    echo "The borrower public key in this file does not match Account public key (xpub)." >&2
+    exit 1
+  fi
+  if [[ "${BANK_XPUB}" == "${BORROWER_XPUB}" ]]; then
+    echo "The bank and borrower public keys are the same." >&2
+    exit 1
+  fi
+  if [[ "${ROLE}" != "Bank" && "${ROLE}" != "Borrower" ]]; then
+    echo "Unrecognized key backup role: ${ROLE}" >&2
+    exit 1
+  fi
+  case "${NETWORK}" in
+    mainnet | testnet | signet | regtest) ;;
+    *)
+      echo "Unsupported Bitcoin network: ${NETWORK}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 core_archive() {
@@ -512,22 +599,241 @@ checksum_for() {
   printf '%s' "${sum}"
 }
 
-party_xprv() {
-  local role="$1"
-  if [[ "${LEFT_role}" == "${role}" ]]; then
-    printf '%s' "${LEFT_xprv}"
+signing_key() {
+  local which="$1"
+  local xpub
+  if [[ "${which}" == "Bank" ]]; then
+    xpub="${BANK_XPUB}"
   else
-    printf '%s' "${RIGHT_xprv}"
+    xpub="${BORROWER_XPUB}"
+  fi
+  if [[ "${ROLE}" == "${which}" ]]; then
+    printf '%s' "${XPRV}"
+  else
+    printf '%s' "${xpub}"
   fi
 }
 
 prepare_descriptor() {
   local bank borrower descriptor
-  bank="$(party_xprv "Bank")"
-  borrower="$(party_xprv "Borrower")"
-  descriptor="wsh(sortedmulti(2,${LEFT_origin}/${LOAN_INDEX}]${LEFT_xpub}/${LOAN_INDEX}/<0;1>/*,${bank}/${LOAN_INDEX}/<0;1>/*,${borrower}/${LOAN_INDEX}/<0;1>/*))"
+  bank="$(signing_key "Bank")"
+  borrower="$(signing_key "Borrower")"
+  descriptor="wsh(sortedmulti(2,${ORIGIN}/${LOAN_INDEX}]${GALLIUM_XPUB}/${LOAN_INDEX}/<0;1>/*,${bank}/${LOAN_INDEX}/<0;1>/*,${borrower}/${LOAN_INDEX}/<0;1>/*))"
   EXTERNAL="$(replace_all "${descriptor}" "/<0;1>/*" "/0/*")"
   CHANGE="$(replace_all "${descriptor}" "/<0;1>/*" "/1/*")"
+}
+
+valid_amount() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]{1,8})?$ ]] || return 1
+  awk -v amount="$1" 'BEGIN { exit !(amount + 0 > 0) }'
+}
+
+valid_destination() {
+  [[ "$1" =~ ^[A-Za-z0-9]+$ ]]
+}
+
+require_key_token() {
+  local label="$1"
+  local value="$2"
+  case "${value}" in
+    *[!A-Za-z0-9]*)
+      echo "${label} is not a single key." >&2
+      exit 1
+      ;;
+  esac
+}
+
+read_psbt_bundle() {
+  local file="$1"
+  local seen=0 line
+  PSBT_BODY=""
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${seen}" -eq 1 ]]; then
+      PSBT_BODY="${PSBT_BODY}${line}"
+    fi
+    if [[ "${line}" == "PSBT:" ]]; then
+      seen=1
+    fi
+  done < "${file}"
+  if [[ -z "${PSBT_BODY}" ]]; then
+    echo "That file does not contain a Gallium recovery PSBT." >&2
+    exit 1
+  fi
+}
+
+open_wallet() {
+  local slug
+  slug="$(printf '%s' "${ROLE}" | tr '[:upper:]' '[:lower:]')"
+  WALLET="gallium-recovery-${LOAN_INDEX}-${slug}"
+  FRESH_WALLET=0
+  if bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descriptors=true >/dev/null 2>&1; then
+    FRESH_WALLET=1
+  else
+    load_err="$(bitcoin_cli loadwallet "${WALLET}" 2>&1 >/dev/null || true)"
+    if [[ -n "${load_err}" && "${load_err}" != *"already loaded"* ]]; then
+      echo "${load_err}" >&2
+      exit 1
+    fi
+  fi
+  if [[ "${FRESH_WALLET}" -eq 1 ]]; then
+    EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
+    CHANGE_SUM="$(checksum_for "${CHANGE}")"
+    IMPORT="$(bitcoin_cli -rpcwallet="${WALLET}" importdescriptors "[{\"desc\":\"${EXTERNAL}#${EXTERNAL_SUM}\",\"active\":true,\"internal\":false,\"range\":[0,20],\"timestamp\":0},{\"desc\":\"${CHANGE}#${CHANGE_SUM}\",\"active\":true,\"internal\":true,\"range\":[0,20],\"timestamp\":0}]")"
+    SUCCESS_COUNT="$(printf '%s' "${IMPORT}" | grep -o '"success": *true' | wc -l | tr -d ' ' || true)"
+    if [[ "${SUCCESS_COUNT}" != "2" ]]; then
+      echo "Bitcoin Core rejected the recovery descriptors." >&2
+      echo "${IMPORT}" >&2
+      exit 1
+    fi
+  fi
+}
+
+derived_addresses() {
+  local receive change
+  if [[ -z "${EXTERNAL_SUM:-}" ]]; then
+    EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
+    CHANGE_SUM="$(checksum_for "${CHANGE}")"
+  fi
+  receive="$(bitcoin_cli deriveaddresses "${EXTERNAL}#${EXTERNAL_SUM}" "[0,20]")"
+  change="$(bitcoin_cli deriveaddresses "${CHANGE}#${CHANGE_SUM}" "[0,20]")"
+  printf '{"receive":%s,"change":%s}' "${receive}" "${change}"
+}
+
+check_psbt() {
+  local decoded addresses
+  decoded="$(bitcoin_cli decodepsbt "${PSBT_BODY}")"
+  addresses="$(derived_addresses)"
+  DECODED_JSON="${decoded}" ADDRESS_JSON="${addresses}" EXPECT_DESTINATION="${DESTINATION}" EXPECT_AMOUNT="${AMOUNT}" python3 - <<'PY'
+import json, os, sys
+from decimal import Decimal
+
+decoded = json.loads(os.environ["DECODED_JSON"], parse_float=Decimal)
+payload = json.loads(os.environ["ADDRESS_JSON"])
+expect_destination = os.environ["EXPECT_DESTINATION"]
+expect_amount = Decimal(os.environ["EXPECT_AMOUNT"])
+allowed = set(payload["receive"])
+for address in payload["change"]:
+    allowed.add(address)
+
+scale = Decimal("100000000")
+payment = None
+for output in decoded["tx"]["vout"]:
+    script = output.get("scriptPubKey") or {}
+    address = script.get("address")
+    value = output.get("value")
+    if not address or value is None:
+        sys.stderr.write("The payment has an output Bitcoin Core could not identify.\n")
+        sys.exit(1)
+    if address in allowed:
+        continue
+    if payment is not None:
+        sys.stderr.write("The payment has more than one destination.\n")
+        sys.exit(1)
+    payment = (address, value)
+
+if payment is None:
+    sys.stderr.write("The payment does not pay the destination from this escrow.\n")
+    sys.exit(1)
+paid_sats = (payment[1] * scale).to_integral_value()
+expect_sats = (expect_amount * scale).to_integral_value()
+if payment[0] != expect_destination or paid_sats != expect_sats:
+    sys.stderr.write("The payment destination or amount does not match what you entered.\n")
+    sys.stderr.write(f"PSBT pays {payment[1]} BTC to {payment[0]}.\n")
+    sys.exit(1)
+
+for item in decoded.get("inputs", []):
+    witness = item.get("witness_utxo") or {}
+    script = witness.get("scriptPubKey") or {}
+    address = script.get("address")
+    if address not in allowed:
+        sys.stderr.write("The payment spends a coin that is not in this escrow.\n")
+        sys.exit(1)
+
+fee = decoded.get("fee")
+if fee is None:
+    sys.stderr.write("Bitcoin Core did not report a fee for this payment.\n")
+    sys.exit(1)
+print(fee)
+PY
+}
+
+require_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to read the payment." >&2
+    exit 1
+  fi
+}
+
+json_string_field() {
+  local field="$1"
+  python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+value = data.get(sys.argv[1])
+if not isinstance(value, str) or value == "":
+    sys.stderr.write("Bitcoin Core did not return the payment.\n")
+    sys.exit(1)
+sys.stdout.write(value)
+' "${field}"
+}
+
+signed_transaction_hex() {
+  python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if data.get("complete") is not True:
+    sys.stderr.write("The payment still needs another signature.\n")
+    sys.exit(1)
+value = data.get("hex")
+if not isinstance(value, str) or value == "":
+    sys.stderr.write("Bitcoin Core did not return a signed transaction.\n")
+    sys.exit(1)
+sys.stdout.write(value)
+'
+}
+
+write_psbt_file() {
+  local path="$1"
+  local fee="$2"
+  if [[ -e "${path}" ]]; then
+    echo "A file named ${path} already exists in this folder. Move it, then run this again." >&2
+    exit 1
+  fi
+  {
+    echo "Gallium recovery payment"
+    echo "Network: ${NETWORK}"
+    echo "Loan index: ${LOAN_INDEX}"
+    echo "Amount: ${AMOUNT} BTC"
+    echo "Destination: ${DESTINATION}"
+    echo "Fee: ${fee} BTC"
+    echo "PSBT:"
+    echo "${PSBT_BODY}"
+  } >"${path}"
+}
+
+build_psbt() {
+  local result
+  if [[ "${NETWORK}" == "regtest" ]]; then
+    result="$(bitcoin_cli -rpcwallet="${WALLET}" -named send "outputs={\"${DESTINATION}\":${AMOUNT}}" fee_rate=2 psbt=true)"
+  else
+    result="$(bitcoin_cli -rpcwallet="${WALLET}" -named send "outputs={\"${DESTINATION}\":${AMOUNT}}" psbt=true)"
+  fi
+  PSBT_BODY="$(printf '%s' "${result}" | json_string_field psbt)"
+}
+
+validate_payment_fields() {
+  if [[ ! "${LOAN_INDEX}" =~ ^[0-9]+$ ]]; then
+    echo "Loan index must be the number shown on the loan." >&2
+    exit 1
+  fi
+  if ! valid_destination "${DESTINATION}"; then
+    echo "Destination address is invalid." >&2
+    exit 1
+  fi
+  if ! valid_amount "${AMOUNT}"; then
+    echo "Amount must be a positive number of BTC with at most 8 decimal places." >&2
+    exit 1
+  fi
 }
 
 self_test() {
@@ -541,24 +847,115 @@ Gallium account key:
 [aa/48h/1h/0h/2h]tpubGallium
 Account extended private key:
 tprvBank
+Account public key (xpub):
+tpubBank
+Borrower account key:
+tpubBorrower
 EOF
+  use_key_file "${dir}/bank.txt"
+  LOAN_INDEX=7
+  prepare_descriptor
+  [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tpubBorrower/7/0/*))' ]]
+  [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tprvBank/7/1/*,tpubBorrower/7/1/*))' ]]
+  [[ "${BANK_XPUB}" == "tpubBank" ]]
+
   cat >"${dir}/borrower.txt" <<EOF
 Role: Borrower
-Loan: LN-2
+Network: regtest
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Account extended private key:
+tprvBorrower
+Account public key (xpub):
+tpubBorrower
+Bank account key:
+tpubBank
+EOF
+  use_key_file "${dir}/borrower.txt"
+  prepare_descriptor
+  [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tpubBank/7/0/*,tprvBorrower/7/0/*))' ]]
+  [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tpubBank/7/1/*,tprvBorrower/7/1/*))' ]]
+
+  cat >"${dir}/own-only.txt" <<EOF
+Role: Bank
+Network: regtest
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Account extended private key:
+tprvBank
+Account public key (xpub):
+tpubFromOwn
+Borrower account key:
+tpubBorrower
+EOF
+  use_key_file "${dir}/own-only.txt"
+  [[ "${BANK_XPUB}" == "tpubFromOwn" ]]
+
+  cat >"${dir}/partial.txt" <<EOF
+Role: Borrower
 Network: regtest
 Gallium account key:
 [aa/48h/1h/0h/2h]tpubGallium
 Account extended private key:
 tprvBorrower
 EOF
-  load_key_file "${dir}/bank.txt" LEFT
-  load_key_file "${dir}/borrower.txt" RIGHT
-  LOAN_INDEX=7
-  prepare_descriptor
-  [[ "${EXTERNAL}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tprvBorrower/7/0/*))' ]]
-  [[ "${CHANGE}" == 'wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tprvBank/7/1/*,tprvBorrower/7/1/*))' ]]
+  load_key_file "${dir}/partial.txt" OWN
+  NETWORK="${OWN_network}"
+  GALLIUM="${OWN_gallium}"
+  BANK_XPUB=""
+  BORROWER_XPUB="tpubKeep"
+  cat >"${dir}/public.txt" <<EOF
+Network: regtest
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Bank account key:
+tpubBankPublic
+Borrower account key:
+tpubBorrowerPublic
+EOF
+  fill_public_keys "${dir}/public.txt"
+  [[ "${BANK_XPUB}" == "tpubBankPublic" ]]
+  [[ "${BORROWER_XPUB}" == "tpubKeep" ]]
+
+  cat >"${dir}/wrong-public.txt" <<EOF
+Network: signet
+Gallium account key:
+[aa/48h/1h/0h/2h]tpubGallium
+Bank account key:
+tpubBankPublic
+Borrower account key:
+tpubBorrowerPublic
+EOF
+  if ( fill_public_keys "${dir}/wrong-public.txt" ) >/dev/null 2>&1; then
+    echo "expected a mismatched public key file to be rejected" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "Gallium recovery payment" "PSBT:" "cHNidP8BAH" >"${dir}/pay.txt"
+  read_psbt_bundle "${dir}/pay.txt"
+  [[ "${PSBT_BODY}" == "cHNidP8BAH" ]]
+
+  if ! valid_amount "1.5" || ! valid_amount "0.00000001"; then
+    echo "a positive BTC amount was rejected" >&2
+    exit 1
+  fi
+  if valid_amount "0" || valid_amount "0.0" || valid_amount "1.123456789" || valid_amount "1 BTC"; then
+    echo "an invalid BTC amount was accepted" >&2
+    exit 1
+  fi
+  if ! valid_destination "bcrt1qexampleaddress"; then
+    echo "a destination address was rejected" >&2
+    exit 1
+  fi
+  if valid_destination "not an address" || valid_destination ""; then
+    echo "an invalid destination was accepted" >&2
+    exit 1
+  fi
   valid_host "203.0.113.10"
-  ! valid_host "not a host"
+  if valid_host "not a host"; then
+    echo "an invalid host was accepted" >&2
+    exit 1
+  fi
   [[ "$(peer_address "203.0.113.10")" == "203.0.113.10:18444" ]]
   [[ "$(peer_address "127.0.0.1:18444")" == "127.0.0.1:18444" ]]
   rm -rf "${dir}"
@@ -575,101 +972,71 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 echo "gallium-recover.sh ${SCRIPT_VERSION}"
-echo "Enter the file path of each key backup, the loan index, then the address that should receive the funds."
-echo "The key backups are the files downloaded when each key was created. The loan index is the number shown on that loan."
-LEFT_FILE="$(prompt_line "Path to the bank key backup file")"
-RIGHT_FILE="$(prompt_line "Path to the borrower key backup file")"
+echo "One party creates a payment. The other party checks it and broadcasts it."
+echo "Each person uses their own key file. The private key stays on this computer."
+MODE="$(prompt_line "Type create or complete")"
+MODE="$(printf '%s' "${MODE}" | tr '[:upper:]' '[:lower:]')"
+if [[ "${MODE}" != "create" && "${MODE}" != "complete" ]]; then
+  echo "Type create or complete." >&2
+  exit 1
+fi
+
+KEY_FILE="$(prompt_line "Path to your key backup file")"
+KEY_FILE="${KEY_FILE/#\~/${HOME}}"
+if [[ ! -f "${KEY_FILE}" ]]; then
+  echo "No file was found at that path." >&2
+  exit 1
+fi
+use_key_file "${KEY_FILE}"
+
+PSBT_FILE=""
+if [[ "${MODE}" == "complete" ]]; then
+  PSBT_FILE="$(prompt_line "Path to the payment file")"
+  PSBT_FILE="${PSBT_FILE/#\~/${HOME}}"
+  if [[ ! -f "${PSBT_FILE}" ]]; then
+    echo "No file was found at that path." >&2
+    exit 1
+  fi
+fi
+
 LOAN_INDEX="$(prompt_line "Loan index")"
-DESTINATION="$(prompt_line "Bitcoin address to receive the funds")"
-LEFT_FILE="${LEFT_FILE/#\~/${HOME}}"
-RIGHT_FILE="${RIGHT_FILE/#\~/${HOME}}"
+DESTINATION="$(prompt_line "Bitcoin address that receives the funds")"
+AMOUNT="$(prompt_line "Amount the recipient receives, in BTC")"
+validate_payment_fields
+require_python
+
 BITCOIN_CLI="${BITCOIN_CLI:-}"
 BITCOIND=""
 STARTED_NODE=0
 REGTEST_PEER=""
 
-if [[ ! -f "${LEFT_FILE}" || ! -f "${RIGHT_FILE}" ]]; then
-  echo "No file was found at one of those paths. Enter the full path to each key backup file." >&2
-  usage
-fi
-if [[ "${DESTINATION}" == *" "* || "${DESTINATION}" == *'"'* || -z "${DESTINATION}" ]]; then
-  echo "Destination address is invalid." >&2
-  exit 1
-fi
-
-load_key_file "${LEFT_FILE}" LEFT
-load_key_file "${RIGHT_FILE}" RIGHT
-
-if [[ ! "${LOAN_INDEX}" =~ ^[0-9]+$ ]]; then
-  echo "Loan index must be the number shown on the loan." >&2
-  exit 1
-fi
-if [[ "${LEFT_role}" == "${RIGHT_role}" ]]; then
-  echo "Provide one bank key backup and one borrower key backup." >&2
-  exit 1
-fi
-if [[ "${LEFT_role}" != "Bank" && "${LEFT_role}" != "Borrower" ]]; then
-  echo "Unrecognized key backup role: ${LEFT_role}" >&2
-  exit 1
-fi
-if [[ "${RIGHT_role}" != "Bank" && "${RIGHT_role}" != "Borrower" ]]; then
-  echo "Unrecognized key backup role: ${RIGHT_role}" >&2
-  exit 1
-fi
-if [[ "${LEFT_network}" != "${RIGHT_network}" || "${LEFT_gallium}" != "${RIGHT_gallium}" ]]; then
-  echo "These key backups are not for the same Gallium account and network." >&2
-  exit 1
-fi
-
-NETWORK="${LEFT_network}"
-case "${NETWORK}" in
-  mainnet | testnet | signet | regtest) ;;
-  *)
-    echo "Unsupported Bitcoin network: ${NETWORK}" >&2
-    exit 1
-    ;;
-esac
-
 prepare_descriptor
 prepare_node
+open_wallet
 
-WALLET="gallium-recovery-${LOAN_INDEX}"
-FRESH_WALLET=0
-if bitcoin_cli -named createwallet "wallet_name=${WALLET}" blank=true descriptors=true >/dev/null 2>&1; then
-  FRESH_WALLET=1
+if [[ "${MODE}" == "create" ]]; then
+  build_psbt
+  FEE="$(check_psbt)"
+  OUT_FILE="gallium-recovery-${LOAN_INDEX}.psbt.txt"
+  write_psbt_file "${OUT_FILE}" "${FEE}"
+  echo "Wrote ${OUT_FILE}"
+  echo "Fee: ${FEE} BTC. Nothing has been broadcast."
+  echo "Send that file to the other party. It contains a partially signed payment, not your private key."
 else
-  load_err="$(bitcoin_cli loadwallet "${WALLET}" 2>&1 >/dev/null || true)"
-  if [[ -n "${load_err}" && "${load_err}" != *"already loaded"* ]]; then
-    echo "${load_err}" >&2
-    exit 1
+  read_psbt_bundle "${PSBT_FILE}"
+  FEE="$(check_psbt)"
+  echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
+  echo "Pay ${AMOUNT} BTC to ${DESTINATION}"
+  echo "Fee: ${FEE} BTC"
+  if ! confirm "Broadcast this payment"; then
+    echo "Stopped. Nothing was broadcast."
+    exit 0
   fi
+  processed="$(bitcoin_cli -rpcwallet="${WALLET}" walletprocesspsbt "${PSBT_BODY}")"
+  signed="$(printf '%s' "${processed}" | json_string_field psbt)"
+  final="$(bitcoin_cli finalizepsbt "${signed}")"
+  hex="$(printf '%s' "${final}" | signed_transaction_hex)"
+  txid="$(bitcoin_cli sendrawtransaction "${hex}")"
+  echo "Broadcast transaction ${txid}"
+  finish_regtest
 fi
-
-if [[ "${FRESH_WALLET}" -eq 1 ]]; then
-  EXTERNAL_SUM="$(checksum_for "${EXTERNAL}")"
-  CHANGE_SUM="$(checksum_for "${CHANGE}")"
-  EXTERNAL_CHECKED="${EXTERNAL}#${EXTERNAL_SUM}"
-  CHANGE_CHECKED="${CHANGE}#${CHANGE_SUM}"
-  IMPORT="$(bitcoin_cli -rpcwallet="${WALLET}" importdescriptors "[{\"desc\":\"${EXTERNAL_CHECKED}\",\"active\":false,\"internal\":false,\"range\":[0,0],\"timestamp\":0},{\"desc\":\"${CHANGE_CHECKED}\",\"active\":false,\"internal\":true,\"range\":[0,0],\"timestamp\":0}]")"
-  SUCCESS_COUNT="$(printf '%s' "${IMPORT}" | grep -o '"success": *true' | wc -l | tr -d ' ' || true)"
-  if [[ "${SUCCESS_COUNT}" != "2" ]]; then
-    echo "Bitcoin Core rejected the recovery descriptors." >&2
-    echo "${IMPORT}" >&2
-    exit 1
-  fi
-fi
-
-BALANCE="$(bitcoin_cli -rpcwallet="${WALLET}" getbalance)"
-if ! awk -v balance="${BALANCE}" 'BEGIN { exit !(balance + 0 > 0) }'; then
-  echo "Imported the escrow, and it has no spendable balance yet." >&2
-  exit 1
-fi
-
-echo "Loan index ${LOAN_INDEX} on ${NETWORK}"
-echo "Sending ${BALANCE} BTC to ${DESTINATION}"
-if [[ "${NETWORK}" == "regtest" ]]; then
-  bitcoin_cli -rpcwallet="${WALLET}" -named sendall recipients="[\"${DESTINATION}\"]" fee_rate=2
-else
-  bitcoin_cli -rpcwallet="${WALLET}" sendall "[\"${DESTINATION}\"]"
-fi
-finish_regtest
