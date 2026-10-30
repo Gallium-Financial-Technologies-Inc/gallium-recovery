@@ -1,0 +1,10 @@
+version 3.13.17
+base https://github.com/astral-sh/python-build-standalone/releases/download/20261021
+Darwin arm64 cpython-3.13.17+20261021-aarch64-apple-darwin-install_only.tar.gz 9c985cbf327425873469896ce748c7134b6deca8edb81e93c589ad2fc5aff445
+Darwin aarch64 cpython-3.13.17+20261021-aarch64-apple-darwin-install_only.tar.gz 9c985cbf327425873469896ce748c7134b6deca8edb81e93c589ad2fc5aff445
+Darwin x86_64 cpython-3.13.17+20261021-x86_64-apple-darwin-install_only.tar.gz b7d7c2dd63545cabe996191b6f20f0b652c7de123d9ca451dda7e5f1ebbcbbbc
+Linux aarch64 cpython-3.13.17+20261021-aarch64-unknown-linux-gnu-install_only.tar.gz 616ab0a31b2a3f28119582f4d1943e342f13bac2ec5a8dfe8572c3c0bcadb95a
+Linux x86_64 cpython-3.13.17+20261021-x86_64-unknown-linux-gnu-install_only.tar.gz cbda6f7767884fc456860b11fd184391a9320cae00a86c0f49a1c7ac6e236f7a
+Windows AMD64 cpython-3.13.17+20261021-x86_64-pc-windows-msvc-install_only.tar.gz e10b46d9b03a3a494297f336770f55f86474d683061137b1cf595e12e47bcef5
+Windows x86_64 cpython-3.13.17+20261021-x86_64-pc-windows-msvc-install_only.tar.gz e10b46d9b03a3a494297f336770f55f86474d683061137b1cf595e12e47bcef5
+Windows ARM64 cpython-3.13.17+20261021-aarch64-pc-windows-msvc-install_only.tar.gz dd7f2c489a30356b02dc0aca8c210400a09952b06a955d432313d605f8850765

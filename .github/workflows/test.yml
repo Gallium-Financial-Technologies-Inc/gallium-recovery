@@ -11,3 +11,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: Recovery script self-test
         run: ./gallium-recover.sh --self-test
+
+  self-test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Recovery script self-test
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File gallium-recover.ps1 --self-test
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Bitcoin Core 27.1
+        run: |
+          curl -fsSL -o bitcoin-core.tar.gz https://bitcoincore.org/bin/bitcoin-core-27.1/bitcoin-27.1-x86_64-linux-gnu.tar.gz
+          echo "c9840607d230d65f6938b81deaec0b98fe9cb14c3a41a5b13b2c05d044a48422  bitcoin-core.tar.gz" | sha256sum -c
+          tar -xzf bitcoin-core.tar.gz
+          echo "$PWD/bitcoin-27.1/bin" >> "$GITHUB_PATH"
+      - name: Recovery end to end
+        run: python3 test/e2e_recover.py

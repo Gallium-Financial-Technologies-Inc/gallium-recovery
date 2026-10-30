@@ -1,6 +1,6 @@
 # Security
 
-`gallium-recover.sh` reads one key backup, the file that contains your private key. It uses that key only to talk to Bitcoin Core on the machine where you run it. The payment file you send to the other party is a partially signed transaction, not your private key. The script does not phone home to Gallium. Do not point it at another machine's RPC port.
+`gallium-recover.sh` on Mac and Linux, and `gallium-recover.ps1` on Windows, both run `gallium_recover.py`. That program reads one key backup, the file that contains your private key. It uses that key only to talk to Bitcoin Core on the machine where you run it. The payment file you send to the other party is a partially signed transaction, not your private key. The script does not phone home to Gallium. Do not point it at another machine's RPC port.
 
 ## Verify before you run
 
