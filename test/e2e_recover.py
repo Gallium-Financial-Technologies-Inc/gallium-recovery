@@ -435,17 +435,18 @@ def run_script(home, cli, port, cwd, steps, timeout):
     return code, buf
 
 
-def create_steps(key_path, destination):
+def create_steps(key_path, destination, fee_mode):
     return (
         ("example: create)", "create"),
         ("gallium-bank-key-LN-1.txt)", key_path),
         ("example: 7)", LOAN_INDEX),
         ("bc1qexampleaddress)", destination),
         ("example: 0.01)", PAY_AMOUNT),
+        ("example: without)", fee_mode),
     )
 
 
-def complete_steps(key_path, payment_path, destination, amount):
+def complete_steps(key_path, payment_path, destination, amount, fee_mode):
     return (
         ("example: create)", "complete"),
         ("gallium-bank-key-LN-1.txt)", key_path),
@@ -453,7 +454,15 @@ def complete_steps(key_path, payment_path, destination, amount):
         ("example: 7)", LOAN_INDEX),
         ("bc1qexampleaddress)", destination),
         ("example: 0.01)", amount),
+        ("example: without)", fee_mode),
     )
+
+
+def fee_paid(transcript):
+    for line in transcript.splitlines():
+        if line.startswith("Fee: ") and line.endswith(" BTC"):
+            return Decimal(line[len("Fee: "):-len(" BTC")])
+    fail("The complete step did not print a fee.\n" + tail(transcript))
 
 
 def assert_not_spent(cli, port, address):
@@ -471,7 +480,20 @@ def received_by(cli, port, destination):
     return Decimal(raw)
 
 
-def main():
+FEE_MODES = ("without", "with")
+
+
+def main(argv):
+    if len(argv) == 0:
+        for mode in FEE_MODES:
+            completed = subprocess.run([sys.executable, __file__, mode])
+            if completed.returncode != 0:
+                return completed.returncode
+        return 0
+    if len(argv) != 1 or argv[0] not in FEE_MODES:
+        sys.stderr.write("Usage: e2e_recover.py [without|with]\n")
+        return 2
+    fee_mode = argv[0]
     if os.name == "nt" or not hasattr(os, "fork"):
         sys.stderr.write("This end-to-end test drives the terminal script on macOS and Linux.\n")
         return 2
@@ -506,7 +528,7 @@ def main():
         print("Pruning the block that holds the deposit.", flush=True)
         prune_past_deposit(cli, port)
         print("Bank creates the payment.", flush=True)
-        code, transcript = run_script(home, cli, port, work, create_steps(bank_path, destination), SCRIPT_TIMEOUT)
+        code, transcript = run_script(home, cli, port, work, create_steps(bank_path, destination, fee_mode), SCRIPT_TIMEOUT)
         if code != 0 or "Nothing has been broadcast." not in transcript:
             fail("Create did not leave an unbroadcast payment.\n" + tail(transcript))
         payment = str(Path(work) / f"gallium-recovery-{LOAN_INDEX}.psbt.txt")
@@ -522,7 +544,7 @@ def main():
             cli,
             port,
             work,
-            complete_steps(borrower_path, payment, destination, WRONG_AMOUNT),
+            complete_steps(borrower_path, payment, destination, WRONG_AMOUNT, fee_mode),
             SCRIPT_TIMEOUT,
         )
         if code == 0 or "does not match" not in transcript:
@@ -534,7 +556,7 @@ def main():
             cli,
             port,
             work,
-            complete_steps(borrower_path, payment, destination, PAY_AMOUNT) + (
+            complete_steps(borrower_path, payment, destination, PAY_AMOUNT, fee_mode) + (
                 ("Broadcast this payment", "y"),
                 ("Mine 1 block now?", "y"),
             ),
@@ -549,9 +571,13 @@ def main():
         if len(txid) != 64:
             fail("Complete did not print a transaction id.\n" + tail(transcript))
         got = received_by(cli, port, destination)
-        if got != Decimal(PAY_AMOUNT):
-            fail(f"Destination received {got} BTC. The payment was {PAY_AMOUNT} BTC, with the fee on top.")
-        print(f"Destination received {PAY_AMOUNT} BTC. Transaction {txid}.", flush=True)
+        fee = fee_paid(transcript)
+        expect = Decimal(PAY_AMOUNT)
+        if fee_mode == "with":
+            expect = expect - fee
+        if got != expect:
+            fail(f"Destination received {got} BTC, expected {expect} BTC for fee mode {fee_mode}. Fee was {fee} BTC.")
+        print(f"Destination received {got} BTC with fee mode {fee_mode}. Transaction {txid}.", flush=True)
         print("e2e ok", flush=True)
         return 0
     except E2EFailure as exc:
@@ -566,4 +592,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

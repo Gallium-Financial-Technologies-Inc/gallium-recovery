@@ -15,6 +15,7 @@ import urllib.request
 import zipfile
 
 if os.name != "nt":
+    import fcntl
     import termios
 from decimal import Decimal
 from pathlib import Path
@@ -156,16 +157,237 @@ def clean_answer(answer):
     return answer.strip()
 
 
+def marker_hold(data, marker):
+    limit = len(marker) - 1
+    if limit > len(data):
+        limit = len(data)
+    size = limit
+    while size > 0:
+        if marker.startswith(data[-size:]):
+            return size
+        size -= 1
+    return 0
+
+
+class LineEditor:
+    """The characters on screen are the characters in the answer. Paste markers are never stored."""
+
+    def __init__(self):
+        self.chars = []
+        self.cursor = 0
+        self.done = False
+        self.pasting = False
+        self.pending = b""
+
+    def feed(self, data):
+        self.pending += data
+        screen = ""
+        while self.pending != b"" and not self.done:
+            moved, drawn = self._step()
+            screen += drawn
+            if not moved:
+                break
+        return screen
+
+    def _step(self):
+        if self.pasting:
+            return self._step_paste()
+        sequences = (
+            (PASTE_START.encode("latin1"), "paste"),
+            (PASTE_END.encode("latin1"), "drop"),
+            (b"\x1b[D", "left"),
+            (b"\x1b[C", "right"),
+            (b"\x1b[3~", "delete"),
+            (b"\x1b[H", "home"),
+            (b"\x1b[F", "end"),
+            (b"\x1b[1~", "home"),
+            (b"\x1b[4~", "end"),
+            (b"\x1b[A", "drop"),
+            (b"\x1b[B", "drop"),
+            (b"\x1bOD", "left"),
+            (b"\x1bOC", "right"),
+        )
+        for sequence, action in sequences:
+            if self.pending.startswith(sequence):
+                self.pending = self.pending[len(sequence):]
+                if action == "paste":
+                    self.pasting = True
+                    return True, ""
+                return True, self._action(action)
+        if self.pending.startswith(b"\x1b"):
+            for sequence, _action in sequences:
+                if sequence.startswith(self.pending):
+                    return False, ""
+            self.pending = self.pending[1:]
+            return True, ""
+        byte = self.pending[:1]
+        self.pending = self.pending[1:]
+        if byte == b"\x7f" or byte == b"\x08":
+            return True, self._backspace()
+        if byte == b"\r" or byte == b"\n":
+            self.done = True
+            return True, ""
+        if byte == b"\x15":
+            return True, self._clear()
+        if byte == b"\x01":
+            return True, self._home()
+        if byte == b"\x05":
+            return True, self._end()
+        if byte < b" ":
+            return True, ""
+        return True, self._insert(byte.decode("latin1"))
+
+    def _step_paste(self):
+        marker = PASTE_END.encode("latin1")
+        end_at = self.pending.find(marker)
+        if end_at == -1:
+            hold = marker_hold(self.pending, marker)
+            text = self.pending if hold == 0 else self.pending[:-hold]
+            self.pending = b"" if hold == 0 else self.pending[-hold:]
+            if text == b"":
+                return False, ""
+            return True, self._insert_pasted(text)
+        text = self.pending[:end_at]
+        self.pending = self.pending[end_at + len(marker):]
+        self.pasting = False
+        return True, self._insert_pasted(text)
+
+    def _insert_pasted(self, text):
+        screen = ""
+        for byte in text:
+            one = bytes((byte,))
+            if one == b"\r" or one == b"\n":
+                self.done = True
+                break
+            if one < b" ":
+                continue
+            screen += self._insert(one.decode("latin1"))
+        return screen
+
+    def _action(self, action):
+        if action == "left":
+            return self._left()
+        if action == "right":
+            return self._right()
+        if action == "delete":
+            return self._delete()
+        if action == "home":
+            return self._home()
+        if action == "end":
+            return self._end()
+        return ""
+
+    def _insert(self, char):
+        self.chars.insert(self.cursor, char)
+        tail = "".join(self.chars[self.cursor + 1:])
+        self.cursor += 1
+        if tail == "":
+            return char
+        return char + tail + ("\b" * len(tail))
+
+    def _backspace(self):
+        if self.cursor == 0:
+            return ""
+        self.cursor -= 1
+        del self.chars[self.cursor]
+        tail = "".join(self.chars[self.cursor:])
+        return "\b" + tail + " " + ("\b" * (len(tail) + 1))
+
+    def _delete(self):
+        if self.cursor >= len(self.chars):
+            return ""
+        del self.chars[self.cursor]
+        tail = "".join(self.chars[self.cursor:])
+        return tail + " " + ("\b" * (len(tail) + 1))
+
+    def _left(self):
+        if self.cursor == 0:
+            return ""
+        self.cursor -= 1
+        return "\b"
+
+    def _right(self):
+        if self.cursor >= len(self.chars):
+            return ""
+        char = self.chars[self.cursor]
+        self.cursor += 1
+        return char
+
+    def _home(self):
+        moves = self.cursor
+        self.cursor = 0
+        return "\b" * moves
+
+    def _end(self):
+        tail = "".join(self.chars[self.cursor:])
+        self.cursor = len(self.chars)
+        return tail
+
+    def _clear(self):
+        moves = self.cursor
+        width = len(self.chars)
+        self.chars = []
+        self.cursor = 0
+        return ("\b" * moves) + (" " * width) + ("\b" * width)
+
+    def answer(self):
+        return "".join(self.chars)
+
+
+def read_available(fd):
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        try:
+            extra = os.read(fd, 4096)
+        except BlockingIOError:
+            extra = b""
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+    return extra
+
+
+def read_console_line(reader, writer):
+    if os.name == "nt":
+        answer = reader.readline()
+        if answer == "":
+            return None
+        return clean_answer(answer)
+    fd = reader.fileno()
+    saved = termios.tcgetattr(fd)
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = saved
+    lflag = lflag & ~(termios.ICANON | termios.ECHO | termios.ECHONL)
+    cc[termios.VMIN] = 1
+    cc[termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    editor = LineEditor()
+    try:
+        while not editor.done:
+            chunk = os.read(fd, 1024)
+            if chunk == b"":
+                return None
+            chunk += read_available(fd)
+            drawn = editor.feed(chunk)
+            if drawn != "":
+                writer.write(drawn)
+                writer.flush()
+        writer.write("\n")
+        writer.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+    return editor.answer()
+
+
 def prompt_line(label):
     reader, writer = streams()
     answer = ""
     while answer == "":
         writer.write(f"{label}: ")
         writer.flush()
-        answer = reader.readline()
-        if answer == "":
+        answer = read_console_line(reader, writer)
+        if answer is None:
             die(f"A terminal is required to enter {label}.")
-        answer = clean_answer(answer)
+        answer = answer.strip()
     return answer
 
 
@@ -173,20 +395,20 @@ def prompt_optional(label):
     reader, writer = streams()
     writer.write(f"{label}: ")
     writer.flush()
-    answer = reader.readline()
-    if answer == "":
+    answer = read_console_line(reader, writer)
+    if answer is None:
         die(f"A terminal is required to enter {label}.")
-    return clean_answer(answer)
+    return answer.strip()
 
 
 def confirm(prompt):
     reader, writer = streams()
     writer.write(f"{prompt} [y/N] ")
     writer.flush()
-    answer = reader.readline()
-    if answer == "":
+    answer = read_console_line(reader, writer)
+    if answer is None:
         die(f"A terminal is required to confirm: {prompt}")
-    answer = clean_answer(answer)
+    answer = answer.strip()
     return answer == "y" or answer == "Y"
 
 
@@ -318,6 +540,7 @@ class Recovery:
         self.loan_index = ""
         self.destination = ""
         self.amount = ""
+        self.fee_in_amount = False
         self.external = ""
         self.change = ""
         self.external_sum = ""
@@ -811,8 +1034,13 @@ class Recovery:
             payment = (address, value)
         if payment is None:
             die("The payment does not pay the destination from this escrow.")
+        fee = decoded.get("fee")
+        if fee is None:
+            die("Bitcoin Core did not report a fee for this payment.")
         paid_sats = (payment[1] * scale).to_integral_value()
         expect_sats = (Decimal(self.amount) * scale).to_integral_value()
+        if self.fee_in_amount:
+            expect_sats = expect_sats - (Decimal(str(fee)) * scale).to_integral_value()
         if payment[0] != self.destination or paid_sats != expect_sats:
             die(
                 "The payment destination or amount does not match what you entered.\n"
@@ -824,9 +1052,6 @@ class Recovery:
             address = script.get("address")
             if address not in allowed:
                 die("The payment spends a coin that is not in this escrow.")
-        fee = decoded.get("fee")
-        if fee is None:
-            die("Bitcoin Core did not report a fee for this payment.")
         return str(fee)
 
     def build_psbt(self):
@@ -844,6 +1069,8 @@ class Recovery:
         }
         if self.network == "regtest":
             options["fee_rate"] = 2
+        if self.fee_in_amount:
+            options["subtract_fee_from_outputs"] = [0]
         result = self.bitcoin_json([
             f"-rpcwallet={self.wallet}",
             "-named",
@@ -991,6 +1218,16 @@ def self_test():
     expect(clean_answer("\x1b[200~/tmp/key.txt") == "/tmp/key.txt", "pasted path was not cleaned")
     expect(clean_answer("\x1b[201~7") == "7", "paste end marker was left on the next answer")
     expect(clean_answer("  \x1b[200~complete\x1b[201~  ") == "complete", "pasted answer kept surrounding space")
+    pasted = b"\x1b[200~/Users/roopesh/GDrive/roopeshb13/PC/Limbo/key-bo.txt\x1b[201~"
+    editor = LineEditor()
+    editor.feed(pasted + b"\x1b[D" * 4 + b"\x7f" + b"k" + b"\r")
+    expect(editor.done and editor.answer() == "/Users/roopesh/GDrive/roopeshb13/PC/Limbo/key-bk.txt", "editing a pasted path changed the wrong characters")
+    typed = LineEditor()
+    typed.feed(b"create\n")
+    expect(typed.done and typed.answer() == "create", "a typed answer was wrong")
+    entered = LineEditor()
+    entered.feed(b"\x1b[200~complete\r\x1b[201~")
+    expect(entered.done and entered.answer() == "complete", "a pasted answer with a newline was wrong")
     expect(render_bar(0, 8, "Choose create or complete") == "[------------------------] 0%  Choose create or complete", "empty progress bar was wrong")
     expect(render_bar(1, 8, "Read your key file") == "[###---------------------] 12%  Read your key file", "progress bar was wrong")
     expect(render_bar(8, 8, "Finish") == "[########################] 100%  Finish", "full progress bar was wrong")
@@ -1080,6 +1317,15 @@ def self_test():
     say("self-test ok")
 
 
+def prompt_fee_mode():
+    say("With: the fee comes out of the amount, so the destination gets the amount minus the fee. Use this to empty a wallet.")
+    say("Without: the destination gets the amount exactly, and the fee is paid on top.")
+    answer = prompt_line("Include the fee in the amount? Type with or without (example: without)").lower()
+    if answer != "with" and answer != "without":
+        die("Type with or without.")
+    return answer == "with"
+
+
 def validate_payment_fields(session):
     if re.fullmatch(r"[0-9]+", session.loan_index) is None:
         die("Loan index must be the number shown on the loan.")
@@ -1119,7 +1365,8 @@ def run(argv):
     show_progress(3, TOTAL_STEPS, "Enter the payment", False)
     session.loan_index = prompt_line("Loan index shown on the loan (example: 7)")
     session.destination = prompt_line("Bitcoin address that should receive the funds (example: bc1qexampleaddress)")
-    session.amount = prompt_line("Amount that address should receive, in BTC. Do not include the fee (example: 0.01)")
+    session.amount = prompt_line("Amount in BTC (example: 0.01)")
+    session.fee_in_amount = prompt_fee_mode()
     validate_payment_fields(session)
     session.prepare_descriptor()
 
@@ -1161,6 +1408,9 @@ def main(argv):
     except RecoveryError as exc:
         sys.stderr.write(str(exc) + "\n")
         return 1
+    except KeyboardInterrupt:
+        sys.stderr.write("\nStopped.\n")
+        return 130
     finally:
         end_bracketed_paste()
     return 0

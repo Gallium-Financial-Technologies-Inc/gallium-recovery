@@ -29,11 +29,12 @@ To create a payment it asks for:
 2. The escrow public keys file, only when your key backup does not already contain the other party's public key
 3. The loan index shown on that loan
 4. The Bitcoin address that should receive the funds
-5. The amount that address should receive, in BTC
+5. The amount in BTC
+6. Whether the fee comes out of that amount. Type `with` to empty a wallet: the destination gets the amount minus the fee. Type `without` to send the amount exactly, with the fee paid on top.
 
 It writes `gallium-recovery-<loan index>.psbt.txt` in the current folder. Send that file to the other party. It does not contain your private key.
 
-To complete a payment, the other party enters their own key backup, that payment file, the loan index, and the destination and amount they expect. The script rejects the payment unless every input belongs to this escrow and the destination and amount match. It then shows the fee and waits for a yes before broadcasting.
+To complete a payment, the other party enters their own key backup, that payment file, the loan index, and the destination, amount, and with or without fee they expect. The script rejects the payment unless every input belongs to this escrow and the destination and amount match. It then shows the fee and waits for a yes before broadcasting.
 
 A progress bar shows the percent complete. While Bitcoin Core is syncing, or while it is being downloaded, the percent shows how far that step has got.
 
