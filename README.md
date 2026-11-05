@@ -41,6 +41,8 @@ The script sets up Bitcoin Core 27 or newer on this computer. Before it download
 
 On regtest it asks for the address of the machine that already has the chain, then peers to port 18444. That port must accept connections from this computer. Leave the address blank to start an empty local regtest. Regtest uses a fee of 2 sat/vB. On mainnet, Bitcoin Core estimates the fee. After a completed payment on regtest, the script can mine one block so the other machine sees it.
 
+The script finds the loan's coins with `scantxoutset`, which reads only the unspent coin set. That works on a pruned node, whatever the prune size and however old the deposit is. It never rescans old blocks. Finding the coins can take a few minutes on mainnet.
+
 On mainnet it starts Bitcoin Core if needed and waits until the node has finished syncing. A first sync can take a long time. Stopping the script leaves the node running, and the next run continues.
 
 The private keys stay on this computer. Leave `BITCOIN_RPC_HOST` unset.
@@ -64,8 +66,8 @@ Compare the result with `SHA256SUMS` in this repository at the commit the Galliu
 
 1. Reads your key backup and, when needed, the escrow public keys file.
 2. Builds the deposit and change descriptors for that loan index. Your key is the extended private key. Gallium's key and the other party's key stay public.
-3. Imports those descriptors into a new descriptor wallet named for the loan index and your role.
-4. On create, builds a partially signed payment for the amount you entered and writes it to a file.
+3. Imports those descriptors into a new descriptor wallet named for the loan index and your role. The wallet only signs. It does not rescan old blocks.
+4. On create, finds the loan's coins in Bitcoin Core's unspent coin set, builds a partially signed payment from them for the amount you entered, signs it with your key, and writes it to a file.
 5. On complete, checks the inputs, destination, and amount, shows the fee, and broadcasts only after you agree.
 
 ## Tests
@@ -78,7 +80,7 @@ Compare the result with `SHA256SUMS` in this repository at the commit the Galliu
 gallium-recover.cmd --self-test
 ```
 
-The end-to-end test starts a private regtest node, funds a real 2-of-3 escrow, and drives `gallium-recover.sh` through create and complete. It does not mock Bitcoin Core or the script. Bitcoin Core 27 or newer must be on `PATH`, or `BITCOIND` must point at `bitcoind`. It uses the key libraries already installed for the Gallium app when they are next to this repo, and installs them if they are not.
+The end-to-end test starts a private pruned regtest node, funds a real 2-of-3 escrow, deletes the block that holds the deposit, and drives `gallium-recover.sh` through create and complete. It does not mock Bitcoin Core or the script. Bitcoin Core 27 or newer must be on `PATH`, or `BITCOIND` must point at `bitcoind`. It uses the key libraries already installed for the Gallium app when they are next to this repo, and installs them if they are not.
 
 ```bash
 python3 test/e2e_recover.py

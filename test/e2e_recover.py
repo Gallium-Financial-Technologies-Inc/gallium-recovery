@@ -26,6 +26,10 @@ WRONG_AMOUNT = "0.03"
 RPC_USER = "gallium"
 RPC_PASSWORD = "gallium-e2e"
 SCRIPT_TIMEOUT = 120
+PRUNE_STEPS = 80
+PRUNE_STEP_BLOCKS = 10
+PRUNE_STEP_SECONDS = 2400
+PRUNE_KEEP = 300
 KEY_SCRIPT = r"""
 const { HDKey } = require(process.argv[2]);
 const { generateMnemonic, mnemonicToSeedSync } = require(process.argv[3]);
@@ -170,6 +174,8 @@ def start_node(cli, daemon, datadir):
         "-fallbackfee=0.0002",
         "-connect=0",
         "-dnsseed=0",
+        "-fastprune",
+        "-prune=1",
     ]
     process = subprocess.Popen(
         command,
@@ -298,6 +304,22 @@ def fund_escrow(cli, port, address):
     if Decimal(str(total)) != Decimal(FUND_AMOUNT):
         fail(f"Escrow deposit address holds {total} BTC after funding.")
     return destination
+
+
+def prune_past_deposit(cli, port):
+    """Delete the block that holds the deposit, like a pruned mainnet node does."""
+    deposit_height = int(rpc(cli, port, ["getblockcount"]).strip())
+    mine_to = rpc(cli, port, ["-rpcwallet=faucet", "getnewaddress"]).strip()
+    start = int(time.time())
+    for step in range(1, PRUNE_STEPS + 1):
+        # Space the blocks over days, like mainnet, so the deposit is far older than any wallet rescan window.
+        rpc(cli, port, ["setmocktime", str(start + step * PRUNE_STEP_SECONDS)])
+        rpc_json(cli, port, ["-rpcwallet=faucet", "generatetoaddress", str(PRUNE_STEP_BLOCKS), mine_to])
+    tip = int(rpc(cli, port, ["getblockcount"]).strip())
+    rpc(cli, port, ["pruneblockchain", str(tip - PRUNE_KEEP)])
+    info = rpc_json(cli, port, ["getblockchaininfo"])
+    if info["pruned"] is not True or int(info["pruneheight"]) <= deposit_height:
+        fail(f"The deposit at height {deposit_height} was not pruned. Prune height is {info['pruneheight']}.")
 
 
 def child_env(home, cli, port):
@@ -481,6 +503,8 @@ def main():
         deposit = deposit_address(cli, port, keys["gallium"], keys["bank"]["xpub"], keys["borrower"]["xpub"])
         print("Funding the escrow deposit address.", flush=True)
         destination = fund_escrow(cli, port, deposit)
+        print("Pruning the block that holds the deposit.", flush=True)
+        prune_past_deposit(cli, port)
         print("Bank creates the payment.", flush=True)
         code, transcript = run_script(home, cli, port, work, create_steps(bank_path, destination), SCRIPT_TIMEOUT)
         if code != 0 or "Nothing has been broadcast." not in transcript:

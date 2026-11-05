@@ -13,6 +13,9 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+
+if os.name != "nt":
+    import termios
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,6 +24,10 @@ CORE_VERSION = "27.1"
 CORE_MAJOR = 27
 BAR_WIDTH = 24
 TOTAL_STEPS = 8
+PASTE_ON = "\x1b[?2004h"
+PASTE_OFF = "\x1b[?2004l"
+PASTE_START = "\x1b[200~"
+PASTE_END = "\x1b[201~"
 
 CORE_ARCHIVES = {
     ("Linux", "x86_64"): (
@@ -100,6 +107,8 @@ def console():
 
 READER = None
 WRITER = None
+PASTE_ENABLED = False
+SAVED_TTY = None
 
 
 def streams():
@@ -107,6 +116,44 @@ def streams():
     if READER is None or WRITER is None:
         READER, WRITER = console()
     return READER, WRITER
+
+
+def begin_bracketed_paste():
+    global PASTE_ENABLED, SAVED_TTY
+    if os.name == "nt" or PASTE_ENABLED:
+        return
+    reader, writer = streams()
+    fd = reader.fileno()
+    saved = termios.tcgetattr(fd)
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = saved
+    lflag = lflag & ~termios.ECHOCTL
+    termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    SAVED_TTY = saved
+    writer.write(PASTE_ON)
+    writer.flush()
+    PASTE_ENABLED = True
+
+
+def end_bracketed_paste():
+    global PASTE_ENABLED, SAVED_TTY
+    if not PASTE_ENABLED:
+        return
+    PASTE_ENABLED = False
+    try:
+        reader, writer = streams()
+        if SAVED_TTY is not None:
+            termios.tcsetattr(reader.fileno(), termios.TCSANOW, SAVED_TTY)
+            SAVED_TTY = None
+        writer.write(PASTE_OFF)
+        writer.flush()
+    except OSError:
+        return
+
+
+def clean_answer(answer):
+    answer = answer.replace(PASTE_START, "")
+    answer = answer.replace(PASTE_END, "")
+    return answer.strip()
 
 
 def prompt_line(label):
@@ -118,7 +165,7 @@ def prompt_line(label):
         answer = reader.readline()
         if answer == "":
             die(f"A terminal is required to enter {label}.")
-        answer = answer.strip()
+        answer = clean_answer(answer)
     return answer
 
 
@@ -129,7 +176,7 @@ def prompt_optional(label):
     answer = reader.readline()
     if answer == "":
         die(f"A terminal is required to enter {label}.")
-    return answer.strip()
+    return clean_answer(answer)
 
 
 def confirm(prompt):
@@ -139,7 +186,7 @@ def confirm(prompt):
     answer = reader.readline()
     if answer == "":
         die(f"A terminal is required to confirm: {prompt}")
-    answer = answer.strip()
+    answer = clean_answer(answer)
     return answer == "y" or answer == "Y"
 
 
@@ -657,15 +704,34 @@ class Recovery:
                 die("Could not start Bitcoin Core.")
         self.started_node = True
 
-    def checksum_for(self, descriptor):
+    def descriptor_info(self, descriptor):
         code, output = self.bitcoin(["getdescriptorinfo", descriptor])
         if code != 0:
             die(output.rstrip("\n") + "\nBitcoin Core on this computer did not accept the descriptor.")
-        info = json.loads(output)
-        checksum = info.get("checksum", "")
+        return json.loads(output)
+
+    def checksum_for(self, descriptor):
+        checksum = self.descriptor_info(descriptor).get("checksum", "")
         if checksum == "":
             die("Bitcoin Core did not return a descriptor checksum.")
         return checksum
+
+    def find_coins(self):
+        """List this loan's unspent coins from Bitcoin Core's UTXO set. A pruned node keeps the whole set, so this works with any amount of pruning."""
+        scan = []
+        for descriptor in (self.external, self.change):
+            scan.append({"desc": self.descriptor_info(descriptor)["descriptor"], "range": [0, 20]})
+        say("Looking for this loan's coins. This can take a few minutes.")
+        scanned = self.bitcoin_json(["scantxoutset", "start", json.dumps(scan, separators=(",", ":"))])
+        if scanned.get("success") is not True:
+            die("The search for this loan's coins did not finish. Run this again.")
+        coins = scanned.get("unspents", [])
+        if len(coins) == 0:
+            die(
+                f"No coins were found for loan index {self.loan_index} in this escrow.\n"
+                "Check the loan index. A deposit needs one confirmation before it can be found."
+            )
+        return coins
 
     def open_wallet(self):
         slug = self.role.lower()
@@ -677,41 +743,44 @@ class Recovery:
             "blank=true",
             "descriptors=true",
         ])
-        fresh = code == 0
-        if not fresh:
+        if code != 0:
             load_code, load_output = self.bitcoin(["loadwallet", self.wallet])
             if load_code != 0 and "already loaded" not in load_output:
                 die(load_output.rstrip("\n"))
-        if fresh:
-            self.external_sum = self.checksum_for(self.external)
-            self.change_sum = self.checksum_for(self.change)
-            payload = [
-                {
-                    "desc": f"{self.external}#{self.external_sum}",
-                    "active": True,
-                    "internal": False,
-                    "range": [0, 20],
-                    "timestamp": 0,
-                },
-                {
-                    "desc": f"{self.change}#{self.change_sum}",
-                    "active": True,
-                    "internal": True,
-                    "range": [0, 20],
-                    "timestamp": 0,
-                },
-            ]
-            imported = self.bitcoin_json([
-                f"-rpcwallet={self.wallet}",
-                "importdescriptors",
-                json.dumps(payload, separators=(",", ":")),
-            ])
-            success_count = 0
-            for row in imported:
-                if row.get("success") is True:
-                    success_count += 1
-            if success_count != 2:
-                die("Bitcoin Core rejected the recovery descriptors.\n" + json.dumps(imported))
+        existing = self.bitcoin_json([f"-rpcwallet={self.wallet}", "listdescriptors"])
+        if len(existing.get("descriptors", [])) >= 2:
+            return
+        self.external_sum = self.checksum_for(self.external)
+        self.change_sum = self.checksum_for(self.change)
+        # "now" skips the block rescan. A rescan needs every old block, which a pruned node has deleted.
+        # The wallet only signs. The coins come from find_coins.
+        payload = [
+            {
+                "desc": f"{self.external}#{self.external_sum}",
+                "active": True,
+                "internal": False,
+                "range": [0, 20],
+                "timestamp": "now",
+            },
+            {
+                "desc": f"{self.change}#{self.change_sum}",
+                "active": True,
+                "internal": True,
+                "range": [0, 20],
+                "timestamp": "now",
+            },
+        ]
+        imported = self.bitcoin_json([
+            f"-rpcwallet={self.wallet}",
+            "importdescriptors",
+            json.dumps(payload, separators=(",", ":")),
+        ])
+        success_count = 0
+        for row in imported:
+            if row.get("success") is True:
+                success_count += 1
+        if success_count != 2:
+            die("Bitcoin Core rejected the recovery descriptors.\n" + json.dumps(imported))
 
     def derived_addresses(self):
         if self.external_sum == "":
@@ -761,20 +830,38 @@ class Recovery:
         return str(fee)
 
     def build_psbt(self):
-        args = [
+        coins = self.find_coins()
+        inputs = []
+        descriptors = []
+        for coin in coins:
+            inputs.append({"txid": coin["txid"], "vout": coin["vout"]})
+            descriptors.append(coin["desc"])
+        options = {
+            "psbt": True,
+            "inputs": inputs,
+            "add_inputs": False,
+            "solving_data": {"descriptors": descriptors},
+        }
+        if self.network == "regtest":
+            options["fee_rate"] = 2
+        result = self.bitcoin_json([
             f"-rpcwallet={self.wallet}",
             "-named",
             "send",
             f'outputs={{"{self.destination}":{self.amount}}}',
-            "psbt=true",
-        ]
-        if self.network == "regtest":
-            args.append("fee_rate=2")
-        result = self.bitcoin_json(args)
+            "options=" + json.dumps(options, separators=(",", ":")),
+        ])
         psbt = result.get("psbt")
         if not isinstance(psbt, str) or psbt == "":
             die("Bitcoin Core did not return the payment.")
-        self.psbt_body = psbt
+        code, updated = self.bitcoin(["utxoupdatepsbt", psbt, json.dumps(descriptors, separators=(",", ":"))])
+        if code != 0:
+            die(updated.rstrip("\n"))
+        signed = self.bitcoin_json([f"-rpcwallet={self.wallet}", "walletprocesspsbt", updated.strip()])
+        body = signed.get("psbt")
+        if not isinstance(body, str) or body == "":
+            die("Bitcoin Core did not return the payment.")
+        self.psbt_body = body
 
     def write_psbt_file(self, path, fee):
         if os.path.exists(path):
@@ -899,6 +986,11 @@ def read_psbt_text(path):
 
 
 def self_test():
+    expect(clean_answer("create") == "create", "typed answer was changed")
+    expect(clean_answer("\x1b[200~create\x1b[201~") == "create", "pasted answer was not cleaned")
+    expect(clean_answer("\x1b[200~/tmp/key.txt") == "/tmp/key.txt", "pasted path was not cleaned")
+    expect(clean_answer("\x1b[201~7") == "7", "paste end marker was left on the next answer")
+    expect(clean_answer("  \x1b[200~complete\x1b[201~  ") == "complete", "pasted answer kept surrounding space")
     expect(render_bar(0, 8, "Choose create or complete") == "[------------------------] 0%  Choose create or complete", "empty progress bar was wrong")
     expect(render_bar(1, 8, "Read your key file") == "[###---------------------] 12%  Read your key file", "progress bar was wrong")
     expect(render_bar(8, 8, "Finish") == "[########################] 100%  Finish", "full progress bar was wrong")
@@ -1003,6 +1095,7 @@ def run(argv):
         return
     if len(argv) != 0:
         die("Usage: gallium-recover.sh or gallium-recover.ps1\nThe script asks whether to create a payment or complete one, then asks for your key file.")
+    begin_bracketed_paste()
     say(f"gallium-recover {SCRIPT_VERSION}")
     say("One party creates a payment. The other party checks it and broadcasts it.")
     say("Each person uses their own key file. The private key stays on this computer.")
@@ -1068,6 +1161,8 @@ def main(argv):
     except RecoveryError as exc:
         sys.stderr.write(str(exc) + "\n")
         return 1
+    finally:
+        end_bracketed_paste()
     return 0
 
 
