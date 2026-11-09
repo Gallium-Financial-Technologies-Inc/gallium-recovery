@@ -169,10 +169,53 @@ def marker_hold(data, marker):
     return 0
 
 
+def prompt_replay_cut(prompt, data):
+    """How many leading bytes repeat the prompt already shown on this line.
+
+    Cursor sometimes delivers a paste as the tail of the current line plus the
+    clipboard. The tail is a suffix of the prompt, so it is not part of the answer.
+    """
+    if prompt == "" or data == b"":
+        return 0
+    end = len(data)
+    index = 0
+    while index < len(data):
+        if data[index] < 32 or data[index] == 127:
+            end = index
+            break
+        index += 1
+    if end < 8:
+        return 0
+    text = data[:end].decode("latin1")
+    limit = len(prompt)
+    if limit > len(text):
+        limit = len(text)
+    size = limit
+    while size >= 8:
+        if prompt.endswith(text[:size]):
+            return size
+        size -= 1
+    return 0
+
+
+def strip_leading_replay(prompt, data):
+    marker = PASTE_START.encode("latin1")
+    if data.startswith(marker):
+        cut = prompt_replay_cut(prompt, data[len(marker):])
+        if cut == 0:
+            return data
+        return marker + data[len(marker) + cut:]
+    cut = prompt_replay_cut(prompt, data)
+    if cut == 0:
+        return data
+    return data[cut:]
+
+
 class LineEditor:
     """The characters on screen are the characters in the answer. Paste markers are never stored."""
 
-    def __init__(self):
+    def __init__(self, prompt=""):
+        self.prompt = prompt
         self.chars = []
         self.cursor = 0
         self.done = False
@@ -180,6 +223,8 @@ class LineEditor:
         self.pending = b""
 
     def feed(self, data):
+        if self.chars == [] and self.cursor == 0 and not self.pasting and self.pending == b"":
+            data = strip_leading_replay(self.prompt, data)
         self.pending += data
         screen = ""
         while self.pending != b"" and not self.done:
@@ -241,6 +286,10 @@ class LineEditor:
         marker = PASTE_END.encode("latin1")
         end_at = self.pending.find(marker)
         if end_at == -1:
+            # Keep an unfinished paste together so a replayed prompt tail can be
+            # removed from the whole clipboard text, not from a torn piece of it.
+            if self.chars == [] and len(self.pending) < 1024 and self._control_break(self.pending) == -1:
+                return False, ""
             hold = marker_hold(self.pending, marker)
             text = self.pending if hold == 0 else self.pending[:-hold]
             self.pending = b"" if hold == 0 else self.pending[-hold:]
@@ -252,7 +301,19 @@ class LineEditor:
         self.pasting = False
         return True, self._insert_pasted(text)
 
+    def _control_break(self, data):
+        index = 0
+        while index < len(data):
+            if data[index] < 32 or data[index] == 127:
+                return index
+            index += 1
+        return -1
+
     def _insert_pasted(self, text):
+        if self.chars == [] and self.cursor == 0:
+            cut = prompt_replay_cut(self.prompt, text)
+            if cut:
+                text = text[cut:]
         screen = ""
         for byte in text:
             one = bytes((byte,))
@@ -347,7 +408,7 @@ def read_available(fd):
     return extra
 
 
-def read_console_line(reader, writer):
+def read_console_line(reader, writer, prompt):
     if os.name == "nt":
         answer = reader.readline()
         if answer == "":
@@ -360,7 +421,7 @@ def read_console_line(reader, writer):
     cc[termios.VMIN] = 1
     cc[termios.VTIME] = 0
     termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
-    editor = LineEditor()
+    editor = LineEditor(prompt)
     try:
         while not editor.done:
             chunk = os.read(fd, 1024)
@@ -375,16 +436,21 @@ def read_console_line(reader, writer):
         writer.flush()
     finally:
         termios.tcsetattr(fd, termios.TCSANOW, saved)
-    return editor.answer()
+    answer = editor.answer()
+    cut = prompt_replay_cut(prompt, answer.encode("latin1"))
+    if cut:
+        answer = answer[cut:]
+    return answer
 
 
 def prompt_line(label):
     reader, writer = streams()
+    shown = f"{label}: "
     answer = ""
     while answer == "":
-        writer.write(f"{label}: ")
+        writer.write(shown)
         writer.flush()
-        answer = read_console_line(reader, writer)
+        answer = read_console_line(reader, writer, shown)
         if answer is None:
             die(f"A terminal is required to enter {label}.")
         answer = answer.strip()
@@ -393,9 +459,10 @@ def prompt_line(label):
 
 def prompt_optional(label):
     reader, writer = streams()
-    writer.write(f"{label}: ")
+    shown = f"{label}: "
+    writer.write(shown)
     writer.flush()
-    answer = read_console_line(reader, writer)
+    answer = read_console_line(reader, writer, shown)
     if answer is None:
         die(f"A terminal is required to enter {label}.")
     return answer.strip()
@@ -403,9 +470,10 @@ def prompt_optional(label):
 
 def confirm(prompt):
     reader, writer = streams()
-    writer.write(f"{prompt} [y/N] ")
+    shown = f"{prompt} [y/N] "
+    writer.write(shown)
     writer.flush()
-    answer = read_console_line(reader, writer)
+    answer = read_console_line(reader, writer, shown)
     if answer is None:
         die(f"A terminal is required to confirm: {prompt}")
     answer = answer.strip()
@@ -570,6 +638,8 @@ class Recovery:
         origin, xpub = gallium.split("]", 1)
         if origin == "" or xpub == "" or "/" in xpub:
             die(f"Gallium account key is not an account key in {path}.")
+        if network not in ("mainnet", "testnet", "signet", "regtest"):
+            die(f"Unsupported Bitcoin network: {network}")
         self.role = role
         self.network = network
         self.gallium = gallium
@@ -577,10 +647,8 @@ class Recovery:
         self.gallium_xpub = xpub
         self.xprv = xprv
         self.own_xpub = next_line(path, "Account public key (xpub):")
-        self.bank_xpub = next_line(path, "Bank account key:")
-        self.borrower_xpub = next_line(path, "Borrower account key:")
 
-    def fill_public_keys(self, path):
+    def load_public_keys(self, path):
         network = field_value(path, "Network")
         gallium = next_line(path, "Gallium account key:")
         bank = next_line(path, "Bank account key:")
@@ -589,37 +657,29 @@ class Recovery:
             die(f"Could not read the escrow public keys: {path}")
         if network != self.network or gallium != self.gallium:
             die("Those public keys are not for this key backup's network and Gallium key.")
-        if self.bank_xpub == "":
-            self.bank_xpub = bank
-        if self.borrower_xpub == "":
-            self.borrower_xpub = borrower
+        self.bank_xpub = bank
+        self.borrower_xpub = borrower
 
     def use_key_file(self, path):
         self.load_key_file(path)
-        if self.role == "Bank" and self.bank_xpub == "":
-            self.bank_xpub = self.own_xpub
-        if self.role == "Borrower" and self.borrower_xpub == "":
-            self.borrower_xpub = self.own_xpub
-        if self.bank_xpub == "" or self.borrower_xpub == "":
-            say("This key file does not include the other party's public key.")
-            public_file = expand_path(prompt_line("Full path to the escrow public keys file (example: ~/Downloads/gallium-escrow-public-LN-1.txt)"))
-            if not os.path.isfile(public_file):
-                die("No file was found at that path.")
-            self.fill_public_keys(public_file)
-        if self.bank_xpub == "" or self.borrower_xpub == "":
-            die("The bank and borrower public keys are required.")
+        say("The escrow public keys for this loan name the bank and borrower keys. Use the file from this loan's page.")
+        public_file = expand_path(prompt_line("Full path to the escrow public keys file (example: ~/Downloads/gallium-escrow-public-LN-1.txt)"))
+        if not os.path.isfile(public_file):
+            die("No file was found at that path.")
+        self.load_public_keys(public_file)
+        self.check_keys()
+
+    def check_keys(self):
         require_key_token("Bank account key", self.bank_xpub)
         require_key_token("Borrower account key", self.borrower_xpub)
         if self.role == "Bank" and self.own_xpub != "" and self.bank_xpub != self.own_xpub:
-            die("The bank public key in this file does not match Account public key (xpub).")
+            die("The bank key in the escrow public keys does not match Account public key (xpub) in your key backup.")
         if self.role == "Borrower" and self.own_xpub != "" and self.borrower_xpub != self.own_xpub:
-            die("The borrower public key in this file does not match Account public key (xpub).")
+            die("The borrower key in the escrow public keys does not match Account public key (xpub) in your key backup.")
         if self.bank_xpub == self.borrower_xpub:
             die("The bank and borrower public keys are the same.")
         if self.role != "Bank" and self.role != "Borrower":
             die(f"Unrecognized key backup role: {self.role}")
-        if self.network not in ("mainnet", "testnet", "signet", "regtest"):
-            die(f"Unsupported Bitcoin network: {self.network}")
 
     def signing_key(self, which):
         if which == "Bank":
@@ -1228,6 +1288,28 @@ def self_test():
     entered = LineEditor()
     entered.feed(b"\x1b[200~complete\r\x1b[201~")
     expect(entered.done and entered.answer() == "complete", "a pasted answer with a newline was wrong")
+    path_prompt = "Full path to your own key backup file (example: ~/Downloads/gallium-bank-key-LN-1.txt): "
+    replay = path_prompt[path_prompt.index("~"):]
+    real_path = "/Users/roopesh/GDrive/roopeshb13/PC/Limbo/key-bk.txt"
+    replayed = LineEditor(path_prompt)
+    replay_screen = replayed.feed(b"\x1b[200~" + (replay + real_path).encode("latin1") + b"\x1b[201~\r")
+    expect(replayed.done and replayed.answer() == real_path, "a paste that repeated the prompt example kept the example")
+    expect(replay not in replay_screen and real_path in replay_screen, "a paste that repeated the prompt example was shown wrong")
+    plain = LineEditor(path_prompt)
+    plain.feed((replay + real_path).encode("latin1") + b"\r")
+    expect(plain.done and plain.answer() == real_path, "an unbracketed paste that repeated the prompt example kept the example")
+    split = LineEditor(path_prompt)
+    split.feed(b"\x1b[200~" + replay[:12].encode("latin1"))
+    split_screen = split.feed((replay[12:] + real_path).encode("latin1") + b"\x1b[201~\r")
+    expect(split.done and split.answer() == real_path and replay not in split_screen, "a split paste that repeated the prompt example kept the example")
+    clean = LineEditor(path_prompt)
+    clean.feed(b"\x1b[200~" + real_path.encode("latin1") + b"\x1b[201~\r")
+    expect(clean.done and clean.answer() == real_path, "a clean pasted path was changed")
+    create_prompt = "Type create to make a payment file, or complete to finish and broadcast one (example: create): "
+    create_typed = LineEditor(create_prompt)
+    create_screen = create_typed.feed(b"c")
+    create_screen += create_typed.feed(b"reate\n")
+    expect(create_typed.done and create_typed.answer() == "create" and create_screen == "create", "typing create into the create prompt was changed")
     expect(render_bar(0, 8, "Choose create or complete") == "[------------------------] 0%  Choose create or complete", "empty progress bar was wrong")
     expect(render_bar(1, 8, "Read your key file") == "[###---------------------] 12%  Read your key file", "progress bar was wrong")
     expect(render_bar(8, 8, "Finish") == "[########################] 100%  Finish", "full progress bar was wrong")
@@ -1239,11 +1321,19 @@ def self_test():
         bank_path = str(Path(directory) / "bank.txt")
         Path(bank_path).write_text(
             "Role: Bank\nLoan: LN-1\nNetwork: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
-            "Account extended private key:\ntprvBank\nAccount public key (xpub):\ntpubBank\nBorrower account key:\ntpubBorrower\n",
+            "Account extended private key:\ntprvBank\nAccount public key (xpub):\ntpubBank\nBorrower account key:\ntpubStaleBorrower\n",
+            encoding="utf-8",
+        )
+        public_path = str(Path(directory) / "public.txt")
+        Path(public_path).write_text(
+            "Network: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
+            "Bank account key:\ntpubBank\nBorrower account key:\ntpubBorrower\n",
             encoding="utf-8",
         )
         session = Recovery()
-        session.use_key_file(bank_path)
+        session.load_key_file(bank_path)
+        session.load_public_keys(public_path)
+        session.check_keys()
         session.loan_index = "7"
         session.prepare_descriptor()
         expect(session.external == "wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tpubBorrower/7/0/*))", "bank descriptor was wrong")
@@ -1253,10 +1343,14 @@ def self_test():
         borrower_path = str(Path(directory) / "borrower.txt")
         Path(borrower_path).write_text(
             "Role: Borrower\nNetwork: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
-            "Account extended private key:\ntprvBorrower\nAccount public key (xpub):\ntpubBorrower\nBank account key:\ntpubBank\n",
+            "Account extended private key:\ntprvBorrower\nAccount public key (xpub):\ntpubBorrower\nBank account key:\ntpubStaleBank\n",
             encoding="utf-8",
         )
-        session.use_key_file(borrower_path)
+        session = Recovery()
+        session.load_key_file(borrower_path)
+        session.load_public_keys(public_path)
+        session.check_keys()
+        session.loan_index = "7"
         session.prepare_descriptor()
         expect(session.external == "wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tpubBank/7/0/*,tprvBorrower/7/0/*))", "borrower descriptor was wrong")
         expect(session.change == "wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tpubBank/7/1/*,tprvBorrower/7/1/*))", "borrower change descriptor was wrong")
@@ -1264,29 +1358,21 @@ def self_test():
         own_path = str(Path(directory) / "own-only.txt")
         Path(own_path).write_text(
             "Role: Bank\nNetwork: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
-            "Account extended private key:\ntprvBank\nAccount public key (xpub):\ntpubFromOwn\nBorrower account key:\ntpubBorrower\n",
+            "Account extended private key:\ntprvBank\nAccount public key (xpub):\ntpubFromOwn\n",
             encoding="utf-8",
         )
-        session.use_key_file(own_path)
-        expect(session.bank_xpub == "tpubFromOwn", "own public key was not used")
+        session = Recovery()
+        session.load_key_file(own_path)
+        session.load_public_keys(public_path)
+        rejected = False
+        try:
+            session.check_keys()
+        except RecoveryError:
+            rejected = True
+        expect(rejected, "a public bank key that is not this key's own key was accepted")
 
-        partial_path = str(Path(directory) / "partial.txt")
-        Path(partial_path).write_text(
-            "Role: Borrower\nNetwork: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
-            "Account extended private key:\ntprvBorrower\n",
-            encoding="utf-8",
-        )
-        session.load_key_file(partial_path)
-        session.borrower_xpub = "tpubKeep"
-        public_path = str(Path(directory) / "public.txt")
-        Path(public_path).write_text(
-            "Network: regtest\nGallium account key:\n[aa/48h/1h/0h/2h]tpubGallium\n"
-            "Bank account key:\ntpubBankPublic\nBorrower account key:\ntpubBorrowerPublic\n",
-            encoding="utf-8",
-        )
-        session.fill_public_keys(public_path)
-        expect(session.bank_xpub == "tpubBankPublic", "public bank key was not filled")
-        expect(session.borrower_xpub == "tpubKeep", "existing borrower key was replaced")
+        session = Recovery()
+        session.load_key_file(bank_path)
 
         wrong_path = str(Path(directory) / "wrong-public.txt")
         Path(wrong_path).write_text(
@@ -1296,7 +1382,7 @@ def self_test():
         )
         rejected = False
         try:
-            session.fill_public_keys(wrong_path)
+            session.load_public_keys(wrong_path)
         except RecoveryError:
             rejected = True
         expect(rejected, "expected a mismatched public key file to be rejected")

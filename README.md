@@ -21,12 +21,12 @@ gallium-recover.cmd
 
 Python 3 is used on every system. If it is already installed, the script uses that. If it is not, the script asks before downloading Python 3.13.17 into your home folder at `.gallium-recovery/python`. Both commands run the same program, so the questions and the progress bar are the same. Keep `gallium_recover.py` and `python-release.txt` next to the script you run.
 
-The same key backup works for every loan belonging to that person. The script first asks whether to `create` a payment or `complete` one.
+The same key backup works for every loan belonging to that person. The escrow public keys file must be the one for the loan you are recovering, because it names the other party's key for that loan. The script first asks whether to `create` a payment or `complete` one.
 
 To create a payment it asks for:
 
 1. Path to your own key backup, for example `~/Downloads/gallium-bank-key-LN-1.txt`
-2. The escrow public keys file, only when your key backup does not already contain the other party's public key
+2. The escrow public keys file for that loan, for example `~/Downloads/gallium-escrow-public-LN-1.txt`. It is always asked, and it replaces any other party's key found in the key backup.
 3. The loan index shown on that loan
 4. The Bitcoin address that should receive the funds
 5. The amount in BTC
@@ -65,7 +65,7 @@ Compare the result with `SHA256SUMS` in this repository at the commit the Galliu
 
 ## What it does
 
-1. Reads your key backup and, when needed, the escrow public keys file.
+1. Reads your key backup and the escrow public keys file for the loan.
 2. Builds the deposit and change descriptors for that loan index. Your key is the extended private key. Gallium's key and the other party's key stay public.
 3. Imports those descriptors into a new descriptor wallet named for the loan index and your role. The wallet only signs. It does not rescan old blocks.
 4. On create, finds the loan's coins in Bitcoin Core's unspent coin set, builds a partially signed payment from them for the amount you entered, signs it with your key, and writes it to a file.

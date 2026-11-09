@@ -242,6 +242,26 @@ def make_keys(modules, temp):
     return json.loads(completed.stdout)
 
 
+def write_public_keys(path, gallium, bank_xpub, borrower_xpub):
+    gallium_key = f"[{gallium['fingerprint']}/48h/1h/0h/2h]{gallium['xpub']}"
+    lines = [
+        "GALLIUM ESCROW PUBLIC KEYS",
+        "",
+        "Network: regtest",
+        "",
+        "Gallium account key:",
+        gallium_key,
+        "",
+        "Bank account key:",
+        bank_xpub,
+        "",
+        "Borrower account key:",
+        borrower_xpub,
+        "",
+    ]
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def write_backup(path, role, own, gallium, bank_xpub, borrower_xpub):
     gallium_key = f"[{gallium['fingerprint']}/48h/1h/0h/2h]{gallium['xpub']}"
     lines = [
@@ -435,10 +455,11 @@ def run_script(home, cli, port, cwd, steps, timeout):
     return code, buf
 
 
-def create_steps(key_path, destination, fee_mode):
+def create_steps(key_path, public_path, destination, fee_mode):
     return (
         ("example: create)", "create"),
         ("gallium-bank-key-LN-1.txt)", key_path),
+        ("gallium-escrow-public-LN-1.txt)", public_path),
         ("example: 7)", LOAN_INDEX),
         ("bc1qexampleaddress)", destination),
         ("example: 0.01)", PAY_AMOUNT),
@@ -446,10 +467,11 @@ def create_steps(key_path, destination, fee_mode):
     )
 
 
-def complete_steps(key_path, payment_path, destination, amount, fee_mode):
+def complete_steps(key_path, public_path, payment_path, destination, amount, fee_mode):
     return (
         ("example: create)", "complete"),
         ("gallium-bank-key-LN-1.txt)", key_path),
+        ("gallium-escrow-public-LN-1.txt)", public_path),
         ("gallium-recovery-7.psbt.txt)", payment_path),
         ("example: 7)", LOAN_INDEX),
         ("bc1qexampleaddress)", destination),
@@ -522,13 +544,15 @@ def main(argv):
             keys["bank"]["xpub"],
             keys["borrower"]["xpub"],
         )
+        public_path = str(Path(work) / "escrow-public.txt")
+        write_public_keys(public_path, keys["gallium"], keys["bank"]["xpub"], keys["borrower"]["xpub"])
         deposit = deposit_address(cli, port, keys["gallium"], keys["bank"]["xpub"], keys["borrower"]["xpub"])
         print("Funding the escrow deposit address.", flush=True)
         destination = fund_escrow(cli, port, deposit)
         print("Pruning the block that holds the deposit.", flush=True)
         prune_past_deposit(cli, port)
         print("Bank creates the payment.", flush=True)
-        code, transcript = run_script(home, cli, port, work, create_steps(bank_path, destination, fee_mode), SCRIPT_TIMEOUT)
+        code, transcript = run_script(home, cli, port, work, create_steps(bank_path, public_path, destination, fee_mode), SCRIPT_TIMEOUT)
         if code != 0 or "Nothing has been broadcast." not in transcript:
             fail("Create did not leave an unbroadcast payment.\n" + tail(transcript))
         payment = str(Path(work) / f"gallium-recovery-{LOAN_INDEX}.psbt.txt")
@@ -544,7 +568,7 @@ def main(argv):
             cli,
             port,
             work,
-            complete_steps(borrower_path, payment, destination, WRONG_AMOUNT, fee_mode),
+            complete_steps(borrower_path, public_path, payment, destination, WRONG_AMOUNT, fee_mode),
             SCRIPT_TIMEOUT,
         )
         if code == 0 or "does not match" not in transcript:
@@ -556,7 +580,7 @@ def main(argv):
             cli,
             port,
             work,
-            complete_steps(borrower_path, payment, destination, PAY_AMOUNT, fee_mode) + (
+            complete_steps(borrower_path, public_path, payment, destination, PAY_AMOUNT, fee_mode) + (
                 ("Broadcast this payment", "y"),
                 ("Mine 1 block now?", "y"),
             ),
