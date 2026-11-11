@@ -1016,9 +1016,14 @@ class Recovery:
             )
         return coins
 
+    def wallet_name(self):
+        # Built from public keys only. A different escrow gets a different wallet, so an old wallet is never reused.
+        escrow = "|".join([self.gallium, self.bank_xpub, self.borrower_xpub, self.loan_index])
+        digest = hashlib.sha256(escrow.encode("utf-8")).hexdigest()[:16]
+        return f"gallium-recovery-{self.loan_index}-{self.role.lower()}-{digest}"
+
     def open_wallet(self):
-        slug = self.role.lower()
-        self.wallet = f"gallium-recovery-{self.loan_index}-{slug}"
+        self.wallet = self.wallet_name()
         code, _output = self.bitcoin([
             "-named",
             "createwallet",
@@ -1339,6 +1344,12 @@ def self_test():
         expect(session.external == "wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/0/*,tprvBank/7/0/*,tpubBorrower/7/0/*))", "bank descriptor was wrong")
         expect(session.change == "wsh(sortedmulti(2,[aa/48h/1h/0h/2h/7]tpubGallium/7/1/*,tprvBank/7/1/*,tpubBorrower/7/1/*))", "bank change descriptor was wrong")
         expect(session.bank_xpub == "tpubBank", "bank public key was wrong")
+        session.loan_index = "7"
+        first_name = session.wallet_name()
+        session.borrower_xpub = "tpubOtherBorrower"
+        expect(session.wallet_name() != first_name, "a different escrow reused the same wallet name")
+        session.borrower_xpub = "tpubBorrower"
+        expect(session.wallet_name() == first_name, "the same escrow got a different wallet name")
 
         borrower_path = str(Path(directory) / "borrower.txt")
         Path(borrower_path).write_text(

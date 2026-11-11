@@ -67,7 +67,7 @@ Compare the result with `SHA256SUMS` in this repository at the commit the Galliu
 
 1. Reads your key backup and the escrow public keys file for the loan.
 2. Builds the deposit and change descriptors for that loan index. Your key is the extended private key. Gallium's key and the other party's key stay public.
-3. Imports those descriptors into a new descriptor wallet named for the loan index and your role. The wallet only signs. It does not rescan old blocks.
+3. Imports those descriptors into a descriptor wallet named for the loan index, your role, and a hash of the escrow's public keys. A different escrow gets a different wallet. The wallet only signs. It does not rescan old blocks.
 4. On create, finds the loan's coins in Bitcoin Core's unspent coin set, builds a partially signed payment from them for the amount you entered, signs it with your key, and writes it to a file.
 5. On complete, checks the inputs, destination, and amount, shows the fee, and broadcasts only after you agree.
 
